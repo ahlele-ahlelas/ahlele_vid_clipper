@@ -6,8 +6,9 @@ import threading
 from typing import Optional
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLIPS_DIR = os.path.join(BASE_DIR, "tmp", "clips")
-RAW_DIR = os.path.join(BASE_DIR, "tmp", "raw")
+CLIPS_DIR   = os.path.join(BASE_DIR, "tmp", "clips")
+RAW_DIR     = os.path.join(BASE_DIR, "tmp", "raw")
+PREVIEW_DIR = os.path.join(BASE_DIR, "tmp", "preview")
 
 _store: dict = {}
 _lock = threading.Lock()

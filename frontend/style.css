@@ -402,6 +402,22 @@ select option { background: #222; }
   gap: 4px;
   flex-shrink: 0;
 }
+.video-card { position: relative; }
+.card-close-btn {
+  position: absolute;
+  top: 8px; right: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  transition: all var(--trans);
+  z-index: 2;
+}
+.card-close-btn:hover { color: var(--red); background: var(--red-dim); }
+
 .render-action-btn { min-width: 80px; }
 .render-action-btn:disabled { opacity: 0.55; cursor: not-allowed; }
 .render-cancel-btn { border-color: var(--red) !important; color: var(--red) !important; }
@@ -638,6 +654,26 @@ select option { background: #222; }
   gap: 5px;
   margin-top: 4px;
 }
+.conv-error {
+  font-size: 0.72rem;
+  color: var(--red);
+  margin-top: 4px;
+  word-break: break-all;
+}
+
+.conv-save-btn {
+  font-size: 0.75rem;
+  background: var(--green-dim);
+  border: 1px solid rgba(0,255,136,0.3);
+  color: var(--green);
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all var(--trans);
+}
+.conv-save-btn:hover { background: rgba(0,255,136,0.25); }
+.conv-save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 .conv-download-link {
   font-size: 0.75rem;
   background: var(--green-dim);

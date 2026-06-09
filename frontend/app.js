@@ -405,6 +405,7 @@ function buildJobCard(video) {
   card.className = 'video-card fade-in';
 
   card.innerHTML = `
+    <button class="card-close-btn" title="Remove" onclick="this.closest('.video-card').remove(); updateCount()">✕</button>
     <div class="card-thumb">
       ${video.thumbnail
         ? `<img src="${escHtml(video.thumbnail)}" alt="" loading="lazy" onerror="this.parentElement.innerHTML='<div class=\\'thumb-placeholder\\'>🎬</div>'">`
@@ -438,6 +439,7 @@ function buildSearchCard(video) {
   card.className = 'video-card fade-in';
 
   card.innerHTML = `
+    <button class="card-close-btn" title="Remove" onclick="this.closest('.video-card').remove(); updateCount()">✕</button>
     <div class="card-thumb">
       ${video.thumbnail
         ? `<img src="${escHtml(video.thumbnail)}" alt="" loading="lazy" onerror="this.parentElement.innerHTML='<div class=\\'thumb-placeholder\\'>🎬</div>'">`
@@ -711,13 +713,15 @@ function _fillPendingActions(actionsEl, jobId, seg, idx, item) {
   previewBtn.className = 'btn-ghost render-action-btn';
   previewBtn.dataset.action = 'preview';
   previewBtn.textContent = '▶ Preview';
-  previewBtn.addEventListener('click', () => _triggerRender(jobId, seg, item, 'preview'));
+  // preview_only=true: temp render, no save to clips list
+  previewBtn.addEventListener('click', () => _triggerRender(jobId, seg, item, 'preview', true));
 
   const dlBtn = document.createElement('button');
   dlBtn.className = 'btn-ghost render-action-btn';
   dlBtn.dataset.action = 'download';
   dlBtn.textContent = '↓ Download';
-  dlBtn.addEventListener('click', () => _triggerRender(jobId, seg, item, 'download'));
+  // preview_only=false: permanent render, saved to clips list
+  dlBtn.addEventListener('click', () => _triggerRender(jobId, seg, item, 'download', false));
 
   actionsEl.appendChild(previewBtn);
   actionsEl.appendChild(dlBtn);
@@ -747,10 +751,30 @@ function _fillRatioRow(ratioRow, jobId, clipName) {
     ).join('');
 }
 
-function _upgradeClipItem(item, jobId, seg) {
-  item.dataset.rendered = '1';
+function _upgradeClipItem(item, jobId, seg, fromPreview = false) {
+  item.dataset.rendered = fromPreview ? 'preview' : '1';
   const actionsEl = item.querySelector('.clip-actions');
-  if (actionsEl) _fillRenderedActions(actionsEl, jobId, seg.key);
+  if (actionsEl) {
+    actionsEl.innerHTML = '';
+    if (fromPreview) {
+      // Replay preview + permanent download button
+      const replayBtn = document.createElement('button');
+      replayBtn.className = 'btn-ghost';
+      replayBtn.textContent = '▶';
+      replayBtn.addEventListener('click', () => previewClip(jobId, seg.key));
+
+      const dlBtn = document.createElement('button');
+      dlBtn.className = 'btn-ghost render-action-btn';
+      dlBtn.dataset.action = 'download';
+      dlBtn.textContent = '↓ Download';
+      dlBtn.addEventListener('click', () => _triggerRender(jobId, seg, item, 'download', false));
+
+      actionsEl.appendChild(replayBtn);
+      actionsEl.appendChild(dlBtn);
+    } else {
+      _fillRenderedActions(actionsEl, jobId, seg.key);
+    }
+  }
   const ratioRow = item.querySelector('.ratio-row');
   if (ratioRow) {
     _fillRatioRow(ratioRow, jobId, seg.key);
@@ -758,7 +782,7 @@ function _upgradeClipItem(item, jobId, seg) {
   }
 }
 
-async function _triggerRender(jobId, seg, item, action) {
+async function _triggerRender(jobId, seg, item, action, previewOnly = false) {
   const btns = item.querySelectorAll('.render-action-btn');
   btns.forEach(b => {
     b.disabled = true;
@@ -775,7 +799,7 @@ async function _triggerRender(jobId, seg, item, action) {
     const res = await fetch('/api/render', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job_id: jobId, start: seg.start, end: seg.end }),
+      body: JSON.stringify({ job_id: jobId, start: seg.start, end: seg.end, preview_only: previewOnly }),
     });
     const d = await res.json();
     if (d.error) {
@@ -785,7 +809,7 @@ async function _triggerRender(jobId, seg, item, action) {
     }
 
     cancelBtn.addEventListener('click', () => _cancelRender(d.render_id, item));
-    _pollRender(d.render_id, jobId, seg, item, action, cancelBtn);
+    _pollRender(d.render_id, jobId, seg, item, action, cancelBtn, previewOnly);
   } catch (e) {
     _resetPendingBtns(item);
   }
@@ -806,7 +830,7 @@ function _resetPendingBtns(item) {
   item.querySelectorAll('.render-cancel-btn').forEach(b => b.remove());
 }
 
-function _pollRender(renderId, jobId, seg, item, pendingAction, cancelBtn) {
+function _pollRender(renderId, jobId, seg, item, pendingAction, cancelBtn, previewOnly = false) {
   const iv = setInterval(async () => {
     try {
       const res = await fetch(`/api/render/${encodeURIComponent(renderId)}`);
@@ -815,7 +839,7 @@ function _pollRender(renderId, jobId, seg, item, pendingAction, cancelBtn) {
       if (d.status === 'ready') {
         clearInterval(iv);
         if (cancelBtn) cancelBtn.remove();
-        _upgradeClipItem(item, jobId, seg);
+        _upgradeClipItem(item, jobId, seg, previewOnly);
         if (pendingAction === 'preview') {
           previewClip(jobId, d.output);
         } else {
@@ -947,7 +971,7 @@ async function convertClip(btn, jobId, clipName) {
     const res = await fetch('/api/convert', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job_id: jobId, clip_name: clipName, aspect_ratio: ratio }),
+      body: JSON.stringify({ job_id: jobId, clip_name: clipName, aspect_ratio: ratio, preview_only: true }),
     });
     const d = await res.json();
     if (d.error) { btn.textContent = '✗'; btn.title = d.error; return; }
@@ -966,11 +990,11 @@ function pollConversion(convId, btn, jobId) {
       if (d.status === 'ready') {
         clearInterval(iv);
         btn.classList.remove('ratio-btn-loading');
-        // Find the conv-results div for this clip item
         const clipItem = btn.closest('.clip-item');
         const convResults = clipItem && clipItem.querySelector('.conv-results');
         if (convResults) {
           const ratio = btn.dataset.ratio;
+          const clipName = btn.closest('.clip-item') && btn.closest('.clip-item').dataset.clipKey;
           const wrap = document.createElement('div');
           wrap.className = 'conv-result-row';
 
@@ -980,15 +1004,14 @@ function pollConversion(convId, btn, jobId) {
           previewBtn.title = `Preview ${ratio}`;
           previewBtn.onclick = () => previewClip(jobId, d.output);
 
-          const dl = document.createElement('a');
-          dl.className = 'conv-download-link';
-          dl.href = `/api/download/${encodeURIComponent(jobId)}/${encodeURIComponent(d.output)}`;
-          dl.download = d.output;
-          dl.textContent = `↓ ${ratio}`;
-          dl.title = d.output;
+          const saveBtn = document.createElement('button');
+          saveBtn.className = 'btn-ghost conv-save-btn';
+          saveBtn.textContent = `↓ Save`;
+          saveBtn.title = `Save ${ratio} permanently`;
+          saveBtn.onclick = () => _saveConversion(saveBtn, jobId, clipName || d.output, ratio);
 
           wrap.appendChild(previewBtn);
-          wrap.appendChild(dl);
+          wrap.appendChild(saveBtn);
           convResults.appendChild(wrap);
         }
         btn.textContent = btn.dataset.ratio;
@@ -997,11 +1020,58 @@ function pollConversion(convId, btn, jobId) {
         clearInterval(iv);
         btn.classList.remove('ratio-btn-loading');
         btn.textContent = '✗';
-        btn.title = d.error || 'Conversion failed';
         btn.classList.add('ratio-btn-failed');
+        const errMsg = d.error || 'Conversion failed';
+        btn.title = errMsg;
+        const clipItem = btn.closest('.clip-item');
+        if (clipItem) {
+          let errEl = clipItem.querySelector('.conv-error');
+          if (!errEl) { errEl = document.createElement('div'); errEl.className = 'conv-error'; clipItem.appendChild(errEl); }
+          errEl.textContent = errMsg.slice(0, 200);
+        }
       }
     } catch (_) {}
   }, 2000);
+}
+
+async function _saveConversion(btn, jobId, clipName, ratio) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const res = await fetch('/api/convert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: jobId, clip_name: clipName, aspect_ratio: ratio, preview_only: false }),
+    });
+    const d = await res.json();
+    if (d.error) { btn.textContent = '✗ Save failed'; btn.title = d.error; btn.disabled = false; return; }
+    // Poll until permanent file is ready, then trigger browser download
+    const iv = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/convert/${encodeURIComponent(d.conv_id)}`);
+        const c = await r.json();
+        if (c.status === 'ready') {
+          clearInterval(iv);
+          const a = document.createElement('a');
+          a.href = `/api/download/${encodeURIComponent(jobId)}/${encodeURIComponent(c.output)}`;
+          a.download = c.output;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          btn.textContent = '✓ Saved';
+        } else if (c.status === 'failed') {
+          clearInterval(iv);
+          btn.textContent = '✗ Save failed';
+          btn.title = c.error || 'Save failed';
+          btn.disabled = false;
+        }
+      } catch (_) {}
+    }, 2000);
+  } catch (e) {
+    btn.textContent = '✗ Save failed';
+    btn.title = e.message;
+    btn.disabled = false;
+  }
 }
 
 // ── Modal ──────────────────────────────────────────────────────────────────────
@@ -1009,7 +1079,7 @@ function previewClip(jobId, clipName) {
   const modal = document.getElementById('previewModal');
   const video = document.getElementById('modalVideo');
   document.getElementById('modalTitle').textContent = clipName;
-  video.src = `/api/preview/${encodeURIComponent(jobId)}/${encodeURIComponent(clipName)}`;
+  video.src = `/api/preview/${encodeURIComponent(jobId)}/${encodeURIComponent(clipName)}?t=${Date.now()}`;
   modal.classList.remove('hidden');
 }
 

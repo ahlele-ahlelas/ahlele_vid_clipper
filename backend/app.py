@@ -162,14 +162,43 @@ def download(job_id, clip_name):
     return send_file(path, as_attachment=True, download_name=clip_name)
 
 
+@app.get("/api/probe/<job_id>/<clip_name>")
+def probe(job_id, clip_name):
+    """Debug: returns ffprobe stream info for a clip."""
+    if _unsafe_path(clip_name):
+        return jsonify({"error": "Invalid filename."}), 400
+    path = os.path.join(jobs.CLIPS_DIR, job_id, clip_name)
+    if not os.path.exists(path):
+        path = os.path.join(jobs.PREVIEW_DIR, job_id, clip_name)
+    if not os.path.exists(path):
+        return jsonify({"error": "File not found."}), 404
+    import shutil, subprocess as _sp
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return jsonify({"error": "ffprobe not found"}), 500
+    r = _sp.run(
+        [ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", path],
+        capture_output=True, timeout=15
+    )
+    import json as _json
+    try:
+        info = _json.loads(r.stdout)
+        streams = [{"index": s["index"], "codec_type": s.get("codec_type"), "codec_name": s.get("codec_name")} for s in info.get("streams", [])]
+    except Exception:
+        streams = []
+    return jsonify({"path": path, "streams": streams})
+
+
 @app.get("/api/preview/<job_id>/<clip_name>")
 def preview(job_id, clip_name):
     if _unsafe_path(clip_name):
         return jsonify({"error": "Invalid filename."}), 400
     path = os.path.join(jobs.CLIPS_DIR, job_id, clip_name)
     if not os.path.exists(path):
+        path = os.path.join(jobs.PREVIEW_DIR, job_id, clip_name)
+    if not os.path.exists(path):
         return jsonify({"error": "File not found."}), 404
-    return send_file(path, mimetype="video/mp4")
+    return send_file(path, mimetype="video/mp4", conditional=True, max_age=0)
 
 
 _bsearches: dict = {}   # search_id -> {status, results, error}
@@ -265,6 +294,8 @@ def convert():
     clip_name  = (data.get("clip_name")   or "").strip()
     aspect     = (data.get("aspect_ratio") or "").strip()
 
+    preview_only = bool(data.get("preview_only", True))   # default: temp
+
     if not job_id or not clip_name or not aspect:
         return jsonify({"error": "job_id, clip_name, aspect_ratio required."}), 400
     if _unsafe_path(clip_name):
@@ -277,8 +308,16 @@ def convert():
 
     def _run():
         try:
-            out_name = clipper.convert_clip(job_id, clip_name, aspect)
+            out_name = clipper.convert_clip(job_id, clip_name, aspect, preview_only=preview_only)
             _conversions[conv_id].update(status="ready", output=out_name)
+            if preview_only:
+                _path = os.path.join(jobs.PREVIEW_DIR, job_id, out_name)
+                def _del(p=_path):
+                    try: os.remove(p)
+                    except OSError: pass
+                t = threading.Timer(3600, _del)
+                t.daemon = True
+                t.start()
         except Exception as e:
             _conversions[conv_id].update(status="failed", error=str(e)[-300:])
 
@@ -306,18 +345,31 @@ def render_start():
     except (TypeError, ValueError):
         return jsonify({"error": "Invalid start/end times."}), 400
 
+    preview_only = bool(data.get("preview_only"))
     render_id  = str(_uuid.uuid4())
     cancel_evt = threading.Event()
-    _renders[render_id]       = {"status": "processing", "output": None, "job_id": job_id, "error": None}
+    _renders[render_id]        = {"status": "processing", "output": None, "job_id": job_id,
+                                   "error": None, "preview_only": preview_only}
     _render_cancels[render_id] = cancel_evt
 
     def _run():
         try:
-            out_name = clipper.render_segment(job_id, start, end, cancel_event=cancel_evt)
+            out_name = clipper.render_segment(job_id, start, end,
+                                              cancel_event=cancel_evt, preview_only=preview_only)
             if cancel_evt.is_set():
                 _renders[render_id].update(status="cancelled", error="Cancelled by user")
             else:
                 _renders[render_id].update(status="ready", output=out_name)
+                if preview_only:
+                    # Auto-delete preview file after 5 minutes
+                    import os as _os
+                    _path = _os.path.join(jobs.PREVIEW_DIR, job_id, out_name)
+                    def _del(p=_path):
+                        try: _os.remove(p)
+                        except OSError: pass
+                    t = threading.Timer(3600, _del)
+                    t.daemon = True
+                    t.start()
         except Exception as e:
             msg = str(e)[-400:]
             status = "cancelled" if "Cancelled" in msg else "failed"

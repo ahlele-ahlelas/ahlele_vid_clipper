@@ -12,10 +12,11 @@ import jobs
 from utils import is_url, format_clip_name
 
 QUALITY_MAP = {
-    "best": "bestvideo+bestaudio/best",
-    "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-    "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-    "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+    "best":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+    "4k": "bestvideo[ext=mp4][height<=2160]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best",
+    "1080p": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    "720p":  "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    "480p":  "bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
 }
 
 
@@ -251,7 +252,7 @@ def download_and_clip(job_id: str) -> None:
     )
 
 
-def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None) -> str:
+def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None, preview_only: bool = False) -> str:
     """
     Download and trim one clip [seg_start, seg_end] on demand.
     seg_end=None → full video from seg_start.
@@ -266,7 +267,7 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None) ->
     url         = job["url"]
     quality_key = job.get("quality") or "best"
     fmt         = QUALITY_MAP.get(quality_key, QUALITY_MAP["best"])
-    clip_dir    = os.path.join(jobs.CLIPS_DIR, job_id)
+    clip_dir    = os.path.join(jobs.PREVIEW_DIR if preview_only else jobs.CLIPS_DIR, job_id)
     os.makedirs(clip_dir, exist_ok=True)
     os.makedirs(jobs.RAW_DIR, exist_ok=True)
 
@@ -286,8 +287,8 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None) ->
 
     clip_path = os.path.join(clip_dir, clip_name)
 
-    # Already rendered
-    if os.path.exists(clip_path):
+    # Use cached permanent clip; always re-render previews (may lack audio from prior run)
+    if not preview_only and os.path.exists(clip_path):
         _add_clip_to_job(job_id, clip_name)
         return clip_name
 
@@ -308,14 +309,18 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None) ->
             raise Exception("Cancelled by user")
 
     # ── Try ranged download ────────────────────────────────────────────────────
+    # Use a single combined stream (not bestvideo+bestaudio) for ranged download —
+    # split DASH formats often lose the audio track when byte-ranges are applied.
     section_file = None
     if seg_end_val:
         tmp_prefix = os.path.join(clip_dir, f"_tmp_{int(seg_start)}_{int(seg_end_val)}")
         try:
             from yt_dlp.utils import download_range_func
+            # [acodec!=none] ensures the selected format has an audio track.
+            # Without it, yt-dlp picks DASH video-only mp4 streams (no audio).
+            range_fmt = "best[ext=mp4][acodec!=none]/best[acodec!=none]/best"
             ydl_opts = {
-                "format": fmt, "quiet": True, "no_warnings": True,
-                "merge_output_format": "mp4",
+                "format": range_fmt, "quiet": True, "no_warnings": True,
                 "outtmpl": tmp_prefix + ".%(ext)s",
                 "download_ranges": download_range_func(None, [(seg_start, seg_end_val)]),
                 "socket_timeout": 60,
@@ -332,11 +337,15 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None) ->
                 raise Exception("Cancelled by user")
             section_file = None
 
+    # -c:v copy keeps original video; -c:a aac converts to browser-compatible audio.
+    # -map 0:v? and 0:a? are optional — won't fail if a stream is missing.
+    _audio_args = ["-map", "0:v?", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k"]
+
     if section_file and os.path.exists(section_file):
         cmd = [_ffmpeg_bin(), "-y", "-i", section_file]
         if clip_dur:
             cmd += ["-ss", "0", "-t", str(clip_dur)]
-        cmd += ["-c", "copy", clip_path]
+        cmd += _audio_args + [clip_path]
         rc, err_bytes = _ffmpeg_run(cmd, cancel_event)
         _remove(section_file)
         if rc != 0:
@@ -364,12 +373,13 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None) ->
         cmd = [_ffmpeg_bin(), "-y", "-ss", str(seg_start), "-i", raw_file]
         if clip_dur:
             cmd += ["-t", str(clip_dur)]
-        cmd += ["-c", "copy", clip_path]
+        cmd += _audio_args + [clip_path]
         rc, err_bytes = _ffmpeg_run(cmd, cancel_event)
         if rc != 0:
             raise RuntimeError(f"FFmpeg error (code {rc}): {err_bytes.decode(errors='replace')[-400:]}")
 
-    _add_clip_to_job(job_id, clip_name)
+    if not preview_only:
+        _add_clip_to_job(job_id, clip_name)
     return clip_name
 
 
@@ -401,7 +411,7 @@ def _ffmpeg_run(cmd: list, cancel_event=None, timeout: int = 300):
 
 
 def fmtdur(s: int) -> str:
-    if not s:
+    if s is None:
         return "unknown"
     m, sec = divmod(s, 60)
     h, m   = divmod(m, 60)
@@ -442,28 +452,35 @@ ASPECT_RATIOS = {
 }
 
 
-def convert_clip(job_id: str, clip_name: str, aspect_ratio: str) -> str:
+def convert_clip(job_id: str, clip_name: str, aspect_ratio: str, preview_only: bool = False) -> str:
     """Re-encode a clip to the given aspect ratio (center-crop). Returns output filename."""
     if aspect_ratio not in ASPECT_RATIOS:
         raise ValueError(f"Unknown aspect ratio: {aspect_ratio}")
 
     w_r, h_r, out_w, out_h = ASPECT_RATIOS[aspect_ratio]
+
+    # Find source — check clips dir first, then preview dir
     input_path = os.path.join(jobs.CLIPS_DIR, job_id, clip_name)
     if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Source clip not found: {clip_name}")
+        preview_src = os.path.join(jobs.PREVIEW_DIR, job_id, clip_name)
+        if os.path.exists(preview_src):
+            input_path = preview_src
+        else:
+            raise FileNotFoundError(
+                f"Source clip not found: {clip_name}. "
+                f"Checked CLIPS={input_path} "
+                f"and PREVIEW={preview_src}"
+            )
 
     ratio_tag = aspect_ratio.replace(":", "x")
     base = clip_name.rsplit(".", 1)[0]
     out_name = f"{base}_{ratio_tag}.mp4"
-    output_path = os.path.join(jobs.CLIPS_DIR, job_id, out_name)
+    out_dir = os.path.join(jobs.PREVIEW_DIR if preview_only else jobs.CLIPS_DIR, job_id)
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, out_name)
 
-    # Center-crop to target aspect ratio, then scale to standard resolution.
-    # Use min() instead of if() — commas inside if() are parsed as filter
-    # separators by FFmpeg before expression eval. Escape min() commas with \,
-    vf = (
-        f"crop=min(iw\\,ih*{w_r}/{h_r}):min(ih\\,iw*{h_r}/{w_r}),"
-        f"scale={out_w}:{out_h}"
-    )
+    # Scale up to fill target box (maintains AR, no letterbox), then center-crop to exact size.
+    vf = f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h}"
 
     cmd = [
         _ffmpeg_bin(), "-y", "-i", input_path,
