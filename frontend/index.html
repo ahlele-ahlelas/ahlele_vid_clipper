@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VideoClipper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- FFmpeg missing banner -->
+  <div id="ffmpegBanner" class="ffmpeg-banner hidden">
+    <span>⚠️ <strong>FFmpeg not detected.</strong> Clipping is disabled until FFmpeg is installed.</span>
+    <span class="install-hints">
+      Windows: <code>winget install Gyan.FFmpeg</code> &nbsp;|&nbsp;
+      macOS: <code>brew install ffmpeg</code> &nbsp;|&nbsp;
+      Linux: <code>sudo apt install ffmpeg</code>
+    </span>
+  </div>
+
+  <header class="app-header">
+    <div class="logo">
+      <span class="logo-icon">✂️</span>
+      <span class="logo-text">VideoClipper</span>
+    </div>
+    <div class="header-badge">yt-dlp + FFmpeg</div>
+  </header>
+
+  <main>
+
+    <!-- ── Search Panel ───────────────────────────────────── -->
+    <section class="panel search-panel">
+      <h2 class="panel-title">Find &amp; Clip Videos</h2>
+
+      <div class="form-grid">
+
+        <div class="form-group span-2">
+          <label for="siteInput">Website URL or Name</label>
+          <div class="site-input-wrap">
+            <input id="siteInput" type="text"
+              placeholder="YouTube, Reddit, X / Twitter, Vimeo — or paste a direct URL…"
+              autocomplete="off" oninput="onSiteInputChange()" />
+            <span id="siteDetectedBadge" class="site-badge hidden"></span>
+          </div>
+        </div>
+
+        <p id="urlOnlyHint" class="url-only-hint hidden"></p>
+
+        <div class="form-group span-2" id="queryGroup">
+          <label for="searchQuery">Search Query</label>
+          <input id="searchQuery" type="text"
+            placeholder="What to search for on this site…"
+            autocomplete="off" />
+        </div>
+
+        <div class="form-group span-2">
+          <label for="context">Related Info / Context <span class="label-hint">(optional)</span></label>
+          <input id="context" type="text"
+            placeholder="Additional context to narrow results…" />
+        </div>
+
+        <div class="form-group">
+          <label for="quality">Quality</label>
+          <select id="quality">
+            <option value="best">Best Available</option>
+            <option value="1080p">1080p</option>
+            <option value="720p">720p</option>
+            <option value="480p">480p</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="resultCount">Results per search</label>
+          <select id="resultCount">
+            <option value="5" selected>5 videos</option>
+            <option value="10">10 videos</option>
+            <option value="15">15 videos</option>
+            <option value="20">20 videos</option>
+            <option value="30">30 videos</option>
+            <option value="50">50 videos</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="browserCookies">Browser Cookies <span class="label-hint">(for Reddit, Twitter, Instagram…)</span></label>
+          <select id="browserCookies" onchange="onBrowserChange()">
+            <option value="">None</option>
+            <option value="chrome">Chrome</option>
+            <option value="firefox">Firefox</option>
+            <option value="edge">Edge</option>
+            <option value="brave">Brave</option>
+            <option value="opera">Opera</option>
+            <option value="vivaldi">Vivaldi</option>
+            <option value="safari">Safari</option>
+            <option value="__file__">Upload cookies.txt (incognito)</option>
+          </select>
+          <div id="cookieFileRow" class="cookie-file-row hidden">
+            <label class="cookie-upload-btn" for="cookieFile">
+              📄 Choose cookies.txt
+              <input type="file" id="cookieFile" accept=".txt" onchange="onCookieFileSelected(this)" />
+            </label>
+            <span id="cookieFileName" class="cookie-file-name">No file chosen</span>
+            <button class="btn-ghost" style="font-size:0.75rem;padding:3px 8px" onclick="clearCookieFile()">✕</button>
+            <span class="label-hint" style="display:block;margin-top:4px">
+              Export via <strong>Get cookies.txt LOCALLY</strong> extension → works in incognito too
+            </span>
+          </div>
+        </div>
+
+        <div class="form-group span-2">
+          <label>Clip Duration</label>
+          <div class="pill-group" id="pillGroup">
+            <button class="pill active" data-value="30">30s</button>
+            <button class="pill" data-value="45">45s</button>
+            <button class="pill" data-value="60">60s</button>
+            <button class="pill" data-value="custom">Custom</button>
+          </div>
+          <div id="customTime" class="custom-time hidden">
+            <div class="time-row">
+              <div class="time-field">
+                <label>Start Time</label>
+                <input id="startTime" type="text" placeholder="00:00:00" />
+              </div>
+              <span class="time-arrow">→</span>
+              <div class="time-field">
+                <label>End Time</label>
+                <input id="endTime" type="text" placeholder="00:00:30" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /form-grid -->
+
+      <div class="submit-row">
+        <button id="submitBtn" class="btn-primary" onclick="findAndClip()">
+          <span class="btn-text">Find &amp; Clip</span>
+          <span class="spinner hidden" id="btnSpinner"></span>
+        </button>
+        <p id="statusBar" class="status-bar"></p>
+      </div>
+    </section>
+
+    <!-- ── Results Panel ──────────────────────────────────── -->
+    <section class="panel results-panel">
+      <div class="panel-header">
+        <h2 class="panel-title">Results</h2>
+        <span id="resultsCount" class="results-count"></span>
+      </div>
+      <div id="resultsGrid" class="results-grid">
+        <div id="emptyResults" class="empty-state">
+          <div class="empty-icon">🎬</div>
+          <p>No results yet — search for a video above.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Download Queue Panel ───────────────────────────── -->
+    <section class="panel queue-panel">
+      <div class="panel-header">
+        <h2 class="panel-title">Download Queue</h2>
+        <div class="queue-btns">
+          <button class="btn-secondary" onclick="downloadAll()">Download All</button>
+          <button class="btn-ghost" onclick="clearCompleted()">Clear Completed</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="queue-table">
+          <thead>
+            <tr>
+              <th>Filename / Title</th>
+              <th>Source</th>
+              <th>Duration</th>
+              <th>Status</th>
+              <th>Download</th>
+            </tr>
+          </thead>
+          <tbody id="queueBody">
+            <tr id="emptyQueue">
+              <td colspan="5" class="empty-queue">No jobs in queue.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ── Login Modal ───────────────────────────────────── -->
+  <div id="loginModal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closeLoginModal()"></div>
+    <div class="modal-box login-box">
+      <div class="modal-header">
+        <span id="loginModalTitle" class="modal-title">🔐 Login to <span id="loginSiteName">Reddit</span></span>
+        <button class="modal-close" onclick="closeLoginModal()">✕</button>
+      </div>
+      <div class="login-body">
+        <p class="login-hint">
+          Credentials used only for this search — never stored.
+        </p>
+        <div class="form-group">
+          <label for="loginUsername">Username / Email</label>
+          <input id="loginUsername" type="text" placeholder="your username" autocomplete="username" />
+        </div>
+        <div class="form-group">
+          <label for="loginPassword">Password</label>
+          <input id="loginPassword" type="password" placeholder="••••••••" autocomplete="current-password" />
+        </div>
+        <div class="login-actions">
+          <button class="btn-primary" onclick="submitBrowserSearch()" id="loginSubmitBtn">
+            <span class="btn-text">Search</span>
+            <span class="spinner hidden" id="loginSpinner"></span>
+          </button>
+          <button class="btn-ghost" onclick="submitBrowserSearch(true)">Search without login</button>
+        </div>
+        <p id="loginError" class="login-error hidden"></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Preview Modal ──────────────────────────────────── -->
+  <div id="previewModal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closeModal()"></div>
+    <div class="modal-box">
+      <div class="modal-header">
+        <span id="modalTitle" class="modal-title">Preview</span>
+        <button class="modal-close" onclick="closeModal()">✕</button>
+      </div>
+      <video id="modalVideo" controls autoplay playsinline></video>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
