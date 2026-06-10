@@ -1,15 +1,62 @@
 from __future__ import annotations
 
-import io
+import json
 import os
+import re
 import sys
 import math
 import time
+import threading
 import subprocess
+from urllib.parse import urlparse
 import yt_dlp
 
 import jobs
 from utils import is_url, format_clip_name
+
+# Per-job locks guarding the shared raw/full download so concurrent renders
+# (e.g. "Render All" → N parallel threads on one job) don't all download the
+# same file at once and corrupt it. Keyed by job_id.
+_DL_LOCKS: dict[str, threading.Lock] = {}
+_DL_LOCKS_GUARD = threading.Lock()
+
+
+def _job_dl_lock(job_id: str) -> threading.Lock:
+    with _DL_LOCKS_GUARD:
+        lock = _DL_LOCKS.get(job_id)
+        if lock is None:
+            lock = threading.Lock()
+            _DL_LOCKS[job_id] = lock
+        return lock
+
+
+class _CaptureLogger:
+    """yt-dlp logger that captures messages to a buffer (thread-safe — no
+    global sys.stderr swap). Suppresses DPAPI/cookie-decrypt noise from stderr
+    but keeps the text for failure detection."""
+
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def debug(self, msg):
+        self.lines.append(str(msg))
+
+    def info(self, msg):
+        self.lines.append(str(msg))
+
+    def warning(self, msg):
+        self.lines.append(str(msg))
+
+    def error(self, msg):
+        s = str(msg)
+        self.lines.append(s)
+        low = s.lower()
+        if "dpapi" not in low and "decrypt" not in low:
+            print(s, file=sys.stderr)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
 
 QUALITY_MAP = {
     "best":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
@@ -31,6 +78,97 @@ _SEARCH_PREFIXES = {
 _URL_ONLY_SOURCES = {"reddit", "twitter", "direct"}
 
 
+_DIRECT_VIDEO_RE = re.compile(r'\.(mp4|webm|mov|mkv|m4v|m3u8|mpd|ts)(\?|$)', re.I)
+
+
+def _direct_video_meta(url: str) -> list:
+    fname = urlparse(url).path.rsplit("/", 1)[-1] or "video"
+    title = fname.rsplit(".", 1)[0].replace("-", " ").replace("_", " ") if "." in fname else fname
+    return [{"url": url, "title": title or "Direct Video", "duration": 0, "thumbnail": ""}]
+
+
+def _streamlink_url(url: str) -> str:
+    """Return best stream URL via streamlink, or '' on failure/not-installed."""
+    try:
+        res = subprocess.run(
+            ["streamlink", "--stream-url", url, "best"],
+            capture_output=True, text=True, timeout=30,
+        )
+        out = res.stdout.strip()
+        return out if out.startswith("http") else ""
+    except Exception:
+        return ""
+
+
+def _streamlink_fetch(url: str) -> list:
+    """Return metadata list via streamlink, or [] if unavailable/unsupported."""
+    stream_url = _streamlink_url(url)
+    if not stream_url:
+        return []
+    title = ""
+    try:
+        res = subprocess.run(
+            ["streamlink", "--json", url],
+            capture_output=True, text=True, timeout=20,
+        )
+        if res.returncode == 0:
+            data = json.loads(res.stdout)
+            meta = data.get("metadata") or {}
+            title = meta.get("title") or meta.get("author") or ""
+    except Exception:
+        pass
+    return [{"url": stream_url, "title": title or urlparse(url).netloc or "Stream",
+             "duration": 0, "thumbnail": ""}]
+
+
+def _gallery_dl_fetch(url: str) -> list:
+    """Return video metadata list via gallery-dl, or [] if unavailable/unsupported."""
+    try:
+        res = subprocess.run(
+            ["gallery-dl", "-j", url],
+            capture_output=True, text=True, timeout=40,
+        )
+        if res.returncode not in (0, 1):
+            return []
+        results = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                # Array format: [status_code, url, {metadata}]
+                if isinstance(item, list) and len(item) >= 2 and item[0] == 1:
+                    file_url = item[1] if isinstance(item[1], str) else ""
+                    meta = item[2] if len(item) > 2 and isinstance(item[2], dict) else {}
+                elif isinstance(item, dict):
+                    file_url = item.get("url", "")
+                    meta = item
+                else:
+                    continue
+                if not file_url.startswith("http"):
+                    continue
+                if not _DIRECT_VIDEO_RE.search(urlparse(file_url).path):
+                    continue
+                fname = urlparse(file_url).path.rsplit("/", 1)[-1]
+                title = (meta.get("title") or
+                         meta.get("filename", "").rsplit(".", 1)[0] or
+                         fname.rsplit(".", 1)[0])
+                results.append({
+                    "url": file_url,
+                    "title": title or fname,
+                    "duration": int(meta.get("duration") or 0),
+                    "thumbnail": meta.get("thumbnail") or "",
+                })
+            except Exception:
+                continue
+        return results[:10]
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+
 def _apply_browser_cookies(ydl_opts: dict, browser: str | None, cookiefile: str | None = None) -> None:
     if cookiefile and os.path.exists(cookiefile):
         ydl_opts["cookiefile"] = cookiefile
@@ -46,23 +184,17 @@ def _ydl_extract(ydl_opts: dict, url: str, download: bool = False):
     - If browser profile not found (server/Colab env), same fallback.
     Returns (info, browser_cookies_failed: bool).
     """
-    buf = io.StringIO()
-    old_stderr = sys.stderr
-    sys.stderr = buf
+    log = _CaptureLogger()
+    opts = {**ydl_opts, "logger": log}
     exc = None
     info = None
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=download)
     except Exception as e:
         exc = e
-    finally:
-        sys.stderr = old_stderr
-        captured = buf.getvalue()
-        for line in captured.splitlines():
-            if "DPAPI" not in line and "decrypt" not in line.lower():
-                print(line, file=sys.stderr)
 
+    captured = log.text
     exc_str = str(exc) if exc is not None else ""
     _combined = (captured + exc_str).lower()
     browser_cookie_fail = (
@@ -77,7 +209,7 @@ def _ydl_extract(ydl_opts: dict, url: str, download: bool = False):
     # exception when cookiesfrombrowser is set (handles platform-specific
     # decryption errors that don't match known message patterns).
     if browser_cookie_fail or ("cookiesfrombrowser" in ydl_opts and exc is not None):
-        retry_opts = {k: v for k, v in ydl_opts.items() if k != "cookiesfrombrowser"}
+        retry_opts = {k: v for k, v in opts.items() if k != "cookiesfrombrowser"}
         with yt_dlp.YoutubeDL(retry_opts) as ydl:
             info = ydl.extract_info(url, download=download)
         return info, True
@@ -106,54 +238,82 @@ def fetch_metadata(query: str, source_type: str = "auto", browser: str | None = 
     else:
         search_target = query
 
+    if direct and _DIRECT_VIDEO_RE.search(urlparse(query).path):
+        return _direct_video_meta(query)
+
+    _headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
     ydl_opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "extract_flat": True,   # fast for both searches and channel/playlist URLs
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        },
+        "http_headers": _headers,
     }
+    if direct:
+        # Full extraction for direct URLs — extract_flat causes yt-dlp to return
+        # the page's listing/related entries instead of the target video.
+        ydl_opts["extract_flat"] = False
+    else:
+        ydl_opts["extract_flat"] = True   # fast for search results / playlists
     _apply_browser_cookies(ydl_opts, browser, cookiefile)
 
-    info, _ = _ydl_extract(ydl_opts, search_target, download=False)
-
-    if not info:
-        return []
-
-    # For playlists/channels/search results use entries; single video → wrap in list
-    entries = info.get("entries") or [info]
-    # Apply count cap (searches already cap via prefix, but channels/playlists may return all)
-    n = max(1, min(count, 50))
-    entries = list(entries)[:n]
+    ydl_exc = None
+    info = None
+    try:
+        info, _ = _ydl_extract(ydl_opts, search_target, download=False)
+    except Exception as e:
+        ydl_exc = e
 
     results = []
-    for entry in entries:
-        if not entry:
-            continue
-        url = entry.get("webpage_url") or entry.get("url") or ""
-        if not url.startswith("http"):
-            vid_id = entry.get("id", "")
-            url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""
-        if not url:
-            continue
+    if info:
+        # Direct URL → return exactly that one video; search/playlist → apply count cap
+        if direct:
+            entries = [info]
+        else:
+            entries = list(info.get("entries") or [info])
+            n = max(1, min(count, 50))
+            entries = entries[:n]
 
-        thumbs = entry.get("thumbnails") or []
-        thumb = entry.get("thumbnail") or (thumbs[-1].get("url") if thumbs else "")
+        for entry in entries:
+            if not entry:
+                continue
+            entry_url = entry.get("webpage_url") or entry.get("url") or ""
+            if not entry_url.startswith("http"):
+                vid_id = entry.get("id", "")
+                entry_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""
+            if not entry_url:
+                continue
 
-        results.append({
-            "url": url,
-            "title": entry.get("title") or "Unknown",
-            "duration": int(entry.get("duration") or 0),
-            "thumbnail": thumb or "",
-        })
+            thumbs = entry.get("thumbnails") or []
+            thumb = entry.get("thumbnail") or (thumbs[-1].get("url") if thumbs else "")
 
-    return results
+            results.append({
+                "url": entry_url,
+                "title": entry.get("title") or "Unknown",
+                "duration": int(entry.get("duration") or 0),
+                "thumbnail": thumb or "",
+            })
+
+    if results:
+        return results
+
+    # yt-dlp found nothing — try alternative extractors (direct URLs only)
+    if direct:
+        sl = _streamlink_fetch(query)
+        if sl:
+            return sl
+        gd = _gallery_dl_fetch(query)
+        if gd:
+            return gd
+
+    if ydl_exc is not None:
+        raise ydl_exc
+    return []
 
 
 def download_and_clip(job_id: str) -> None:
@@ -252,6 +412,80 @@ def download_and_clip(job_id: str) -> None:
     )
 
 
+def render_full_video(job_id: str, cancel_event=None) -> str:
+    """Download the complete video without any clipping. Returns clip_name."""
+    job = jobs.get(job_id)
+    if not job:
+        raise ValueError("Job not found")
+
+    url         = job["url"]
+    quality_key = job.get("quality") or "best"
+    fmt         = QUALITY_MAP.get(quality_key, QUALITY_MAP["best"])
+
+    out_dir = os.path.join(jobs.CLIPS_DIR, job_id)
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(jobs.RAW_DIR, exist_ok=True)
+
+    out_name = "full_video.mp4"
+    out_path = os.path.join(out_dir, out_name)
+    if os.path.exists(out_path):
+        _add_clip_to_job(job_id, out_name)
+        return out_name
+
+    _base_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def _check_cancel(d):
+        if cancel_event and cancel_event.is_set():
+            raise Exception("Cancelled by user")
+
+    raw_base = os.path.join(jobs.RAW_DIR, job_id)
+    raw_file = _find_file(raw_base)
+    if not raw_file:
+        # Serialize per job so a concurrent segment render and this full render
+        # share ONE download of the raw file instead of clobbering each other.
+        with _job_dl_lock(job_id):
+            raw_file = _find_file(raw_base)   # re-check after acquiring lock
+            if not raw_file:
+                if cancel_event and cancel_event.is_set():
+                    raise Exception("Cancelled by user")
+                if not _parallel_http_download(url, raw_base + ".mp4",
+                                               headers=_base_headers, cancel_event=cancel_event):
+                    full_opts = {
+                        "format": fmt, "quiet": True, "no_warnings": True,
+                        "merge_output_format": "mp4",
+                        "outtmpl": raw_base + ".%(ext)s",
+                        "concurrent_fragment_downloads": 16,
+                        "buffersize": 1024 * 1024,
+                        "http_chunk_size": 10 * 1024 * 1024,
+                        "socket_timeout": 60,
+                        "http_headers": _base_headers,
+                        "progress_hooks": [_check_cancel],
+                    }
+                    _apply_browser_cookies(full_opts, job.get("browser"), job.get("cookiefile"))
+                    _apply_fast_dl(full_opts)
+                    _ydl_extract(full_opts, url, download=True)
+                raw_file = _find_file(raw_base)
+
+    if not raw_file:
+        raise RuntimeError("Failed to download full video")
+
+    _audio_args = ["-map", "0:v?", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k"]
+    cmd = [_ffmpeg_bin(), "-y", "-i", raw_file] + _audio_args + [out_path]
+    rc, err_bytes = _ffmpeg_run(cmd, cancel_event)
+    if rc != 0:
+        raise RuntimeError(f"FFmpeg error (code {rc}): {err_bytes.decode(errors='replace')[-400:]}")
+
+    _add_clip_to_job(job_id, out_name)
+    return out_name
+
+
 def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None, preview_only: bool = False) -> str:
     """
     Download and trim one clip [seg_start, seg_end] on demand.
@@ -308,11 +542,16 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None, pr
         if cancel_event and cancel_event.is_set():
             raise Exception("Cancelled by user")
 
+    raw_base = os.path.join(jobs.RAW_DIR, job_id)
+
     # ── Try ranged download ────────────────────────────────────────────────────
     # Use a single combined stream (not bestvideo+bestaudio) for ranged download —
     # split DASH formats often lose the audio track when byte-ranges are applied.
+    # Skip ranged entirely if the full video is already cached (e.g. a prior clip
+    # or "Render All" triggered a full download) — slicing the local file is
+    # instant vs. a fresh network fetch per clip.
     section_file = None
-    if seg_end_val:
+    if seg_end_val and not _find_file(raw_base):
         tmp_prefix = os.path.join(clip_dir, f"_tmp_{int(seg_start)}_{int(seg_end_val)}")
         try:
             from yt_dlp.utils import download_range_func
@@ -323,11 +562,15 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None, pr
                 "format": range_fmt, "quiet": True, "no_warnings": True,
                 "outtmpl": tmp_prefix + ".%(ext)s",
                 "download_ranges": download_range_func(None, [(seg_start, seg_end_val)]),
+                "concurrent_fragment_downloads": 16,
+                "buffersize": 1024 * 1024,
+                "http_chunk_size": 10 * 1024 * 1024,
                 "socket_timeout": 60,
                 "http_headers": _base_headers,
                 "progress_hooks": [_check_cancel],
             }
             _apply_browser_cookies(ydl_opts, job.get("browser"), job.get("cookiefile"))
+            _apply_fast_dl(ydl_opts)
             _ydl_extract(ydl_opts, url, download=True)
             matches = sorted(_glob.glob(tmp_prefix + ".*"))
             if matches:
@@ -352,23 +595,66 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None, pr
             raise RuntimeError(f"FFmpeg error (code {rc}): {err_bytes.decode(errors='replace')[-400:]}")
     else:
         # ── Fallback: full download cached per job + FFmpeg seek ───────────────
-        raw_base = os.path.join(jobs.RAW_DIR, job_id)
+        # Serialize per job so concurrent renders ("Render All") share ONE
+        # download instead of each writing the same raw file at once.
         raw_file = _find_file(raw_base)
         if not raw_file:
-            if cancel_event and cancel_event.is_set():
-                raise Exception("Cancelled by user")
-            full_opts = {
-                "format": fmt, "quiet": True, "no_warnings": True,
-                "merge_output_format": "mp4",
-                "outtmpl": raw_base + ".%(ext)s",
-                "socket_timeout": 60,
-                "http_headers": _base_headers,
-                "progress_hooks": [_check_cancel],
-            }
-            _apply_browser_cookies(full_opts, job.get("browser"), job.get("cookiefile"))
-            _ydl_extract(full_opts, url, download=True)
-            raw_file = _find_file(raw_base)
+            with _job_dl_lock(job_id):
+                raw_file = _find_file(raw_base)   # re-check: another thread may have finished
+                if not raw_file:
+                    if cancel_event and cancel_event.is_set():
+                        raise Exception("Cancelled by user")
+                    if not _parallel_http_download(url, raw_base + ".mp4",
+                                                   headers=_base_headers, cancel_event=cancel_event):
+                        full_opts = {
+                            "format": fmt, "quiet": True, "no_warnings": True,
+                            "merge_output_format": "mp4",
+                            "outtmpl": raw_base + ".%(ext)s",
+                            "concurrent_fragment_downloads": 16,
+                            "buffersize": 1024 * 1024,
+                            "http_chunk_size": 10 * 1024 * 1024,
+                            "socket_timeout": 60,
+                            "http_headers": _base_headers,
+                            "progress_hooks": [_check_cancel],
+                        }
+                        _apply_browser_cookies(full_opts, job.get("browser"), job.get("cookiefile"))
+                        _apply_fast_dl(full_opts)
+                        _ydl_extract(full_opts, url, download=True)
+                    raw_file = _find_file(raw_base)
         if not raw_file:
+            # Last resort: streamlink → ffmpeg direct stream
+            _sl_url = _streamlink_url(url)
+            if _sl_url:
+                cmd = [_ffmpeg_bin(), "-y", "-ss", str(seg_start), "-i", _sl_url]
+                if clip_dur:
+                    cmd += ["-t", str(clip_dur)]
+                cmd += _audio_args + [clip_path]
+                rc, err_bytes = _ffmpeg_run(cmd, cancel_event)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"FFmpeg (streamlink fallback) error (code {rc}): "
+                        f"{err_bytes.decode(errors='replace')[-400:]}"
+                    )
+                if not preview_only:
+                    _add_clip_to_job(job_id, clip_name)
+                return clip_name
+            # IDM fallback — Windows only, silent download then ffmpeg clip
+            idm_raw = _idm_download(url, jobs.RAW_DIR, f"{job_id}_idm.mp4")
+            if idm_raw and os.path.isfile(idm_raw):
+                cmd = [_ffmpeg_bin(), "-y", "-ss", str(seg_start), "-i", idm_raw]
+                if clip_dur:
+                    cmd += ["-t", str(clip_dur)]
+                cmd += _audio_args + [clip_path]
+                rc, err_bytes = _ffmpeg_run(cmd, cancel_event)
+                _remove(idm_raw)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"FFmpeg (IDM fallback) error (code {rc}): "
+                        f"{err_bytes.decode(errors='replace')[-400:]}"
+                    )
+                if not preview_only:
+                    _add_clip_to_job(job_id, clip_name)
+                return clip_name
             raise RuntimeError("Downloaded file not found after full download")
         cmd = [_ffmpeg_bin(), "-y", "-ss", str(seg_start), "-i", raw_file]
         if clip_dur:
@@ -493,6 +779,206 @@ def convert_clip(job_id: str, clip_name: str, aspect_ratio: str, preview_only: b
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode(errors="replace")[-500:])
     return out_name
+
+
+def _parallel_http_download(url: str, out_path: str, n_threads: int = 8,
+                             headers: dict | None = None, cancel_event=None) -> bool:
+    """
+    Download url using N parallel HTTP range-request threads (IDM-style).
+    Returns True on success; False if server doesn't support ranges or any part fails.
+    Requires only stdlib — no extra packages.
+    """
+    import urllib.request
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    hdrs: dict = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        **(headers or {}),
+    }
+
+    def _is_html(ctype: str) -> bool:
+        c = (ctype or "").lower()
+        return "text/html" in c or "application/xhtml" in c
+
+    total = 0
+    accept = ""
+
+    # HEAD to confirm range support and get total size
+    try:
+        req = urllib.request.Request(url, headers=hdrs, method="HEAD")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            # url is a webpage (e.g. a YouTube watch page), not a media file —
+            # never byte-range download HTML or we'd save the page as .mp4.
+            if _is_html(r.headers.get("Content-Type")):
+                return False
+            total = int(r.headers.get("Content-Length") or 0)
+            accept = (r.headers.get("Accept-Ranges") or "").lower()
+    except Exception:
+        pass
+
+    # Many CDNs omit Content-Length on HEAD but return it on GET with a Range probe
+    if not total or accept != "bytes":
+        try:
+            probe_hdrs = {**hdrs, "Range": "bytes=0-0"}
+            req2 = urllib.request.Request(url, headers=probe_hdrs)
+            with urllib.request.urlopen(req2, timeout=20) as r:
+                if _is_html(r.headers.get("Content-Type")):
+                    return False
+                if r.status == 206:
+                    accept = "bytes"
+                    cr = r.headers.get("Content-Range") or ""  # bytes 0-0/TOTAL
+                    if "/" in cr:
+                        total = int(cr.rsplit("/", 1)[1])
+                    if not total:
+                        total = int(r.headers.get("Content-Length") or 0)
+        except Exception:
+            pass
+
+    if not total or accept != "bytes":
+        return False
+
+    # Keep each part ≥256 KB — tiny files don't benefit from splitting and a
+    # naive total//n_threads would give chunk=0 (broken ranges) when total<n.
+    n_threads = max(1, min(n_threads, total // (256 * 1024) or 1))
+    chunk = total // n_threads
+    ranges = [
+        (i * chunk, total - 1 if i == n_threads - 1 else (i + 1) * chunk - 1)
+        for i in range(n_threads)
+    ]
+    tmp_dir = os.path.dirname(out_path) or "."
+    part_paths: list[str | None] = [None] * n_threads
+
+    def _get_part(idx: int) -> str:
+        start, end = ranges[idx]
+        h = {**hdrs, "Range": f"bytes={start}-{end}"}
+        req = urllib.request.Request(url, headers=h)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".part", dir=tmp_dir)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                if r.status != 206:
+                    raise RuntimeError(f"Range not supported: HTTP {r.status}")
+                while True:
+                    if cancel_event and cancel_event.is_set():
+                        raise Exception("Cancelled")
+                    data = r.read(65536)
+                    if not data:
+                        break
+                    tmp.write(data)
+            tmp.close()
+            return tmp.name
+        except Exception:
+            tmp.close()
+            _remove(tmp.name)
+            raise
+
+    try:
+        with ThreadPoolExecutor(max_workers=n_threads) as ex:
+            futs = {ex.submit(_get_part, i): i for i in range(n_threads)}
+            for fut in as_completed(futs):
+                part_paths[futs[fut]] = fut.result()  # raises on any failure
+
+        with open(out_path, "wb") as out:
+            for pp in part_paths:
+                with open(pp, "rb") as ph:
+                    while True:
+                        d = ph.read(65536)
+                        if not d:
+                            break
+                        out.write(d)
+                _remove(pp)
+        return True
+    except Exception:
+        for pp in part_paths:
+            if pp:
+                _remove(pp)
+        return False
+
+
+def _idm_exe() -> str:
+    """Find IDMan.exe via registry then common install paths. Returns '' if not installed."""
+    try:
+        import winreg
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for subkey in (
+                r"SOFTWARE\Internet Download Manager",
+                r"SOFTWARE\WOW6432Node\Internet Download Manager",
+            ):
+                try:
+                    with winreg.OpenKey(root, subkey) as k:
+                        path, _ = winreg.QueryValueEx(k, "ExePath")
+                        if os.path.isfile(path):
+                            return path
+                except Exception:
+                    pass
+    except ImportError:
+        pass
+    for candidate in (
+        r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe",
+        r"C:\Program Files\Internet Download Manager\IDMan.exe",
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _idm_download(url: str, save_dir: str, filename: str, timeout: int = 300) -> str:
+    """
+    Download url via IDM silently (/q /n flags).
+    Returns output path once size stabilises for 3 consecutive seconds.
+    Returns '' if IDM not installed or download times out.
+    """
+    exe = _idm_exe()
+    if not exe:
+        return ""
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, filename)
+    _remove(out_path)
+    subprocess.Popen(
+        [exe, "/d", url, "/p", save_dir, "/f", filename, "/q", "/n"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + timeout
+    last_size = -1
+    stable = 0
+    while time.time() < deadline:
+        time.sleep(1)
+        if not os.path.isfile(out_path):
+            continue
+        sz = os.path.getsize(out_path)
+        if sz > 0 and sz == last_size:
+            stable += 1
+            if stable >= 3:
+                return out_path
+        else:
+            stable = 0
+            last_size = sz
+    return ""
+
+
+def _aria2c_available() -> bool:
+    import shutil
+    return bool(shutil.which("aria2c"))
+
+
+def _apply_fast_dl(opts: dict) -> None:
+    """Inject aria2c external downloader if available; otherwise keep stdlib downloader."""
+    if _aria2c_available():
+        opts["external_downloader"] = "aria2c"
+        opts["external_downloader_args"] = {
+            "aria2c": [
+                "--max-connection-per-server=16",
+                "--min-split-size=1M",
+                "--split=16",
+                "--file-allocation=none",   # skip preallocation — faster start on Windows
+                "--continue=true",
+                "--quiet=true",
+            ]
+        }
 
 
 def _ffmpeg_bin() -> str:

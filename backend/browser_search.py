@@ -394,6 +394,54 @@ _PREVIEW_HINTS = re.compile(
     r'[/_-](?:preview|hover|thumb|teaser|promo|snippet|gif|loop)[/_.-]', re.I
 )
 
+_PLAY_SELECTORS = [
+    '.vjs-big-play-button',           # Video.js
+    '.ytp-large-play-button',         # YouTube embed
+    '.jwplayer .jw-icon-display',     # JW Player
+    '[class*="BigPlayButton"]',       # React Player / custom
+    '[class*="PlayButton"]',
+    '[class*="play-button" i]',
+    'button[class*="play" i]',
+    '[aria-label*="play" i]',
+    '[title*="play" i]',
+    '[data-testid*="play" i]',
+    'video',                          # clicking video itself toggles play
+]
+
+
+def _click_play(page, deadline: float) -> None:
+    """Mute all videos then click play buttons to trigger stream network requests."""
+    try:
+        page.evaluate(
+            "document.querySelectorAll('video').forEach(v => { v.muted = true; v.volume = 0; })"
+        )
+    except Exception:
+        pass
+
+    clicked = 0
+    for sel in _PLAY_SELECTORS:
+        if time.time() > deadline or clicked >= 5:
+            break
+        try:
+            for el in page.locator(sel).all()[:3]:
+                if time.time() > deadline:
+                    break
+                try:
+                    if el.is_visible(timeout=500):
+                        el.click(timeout=1500, force=True)
+                        clicked += 1
+                        page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if clicked:
+        try:
+            page.wait_for_load_state("networkidle", timeout=5_000)
+        except PwTimeout:
+            pass
+
 
 def _generic_crawl(page, url: str, max_seconds: int = 75) -> list:
     """
@@ -402,24 +450,40 @@ def _generic_crawl(page, url: str, max_seconds: int = 75) -> list:
       1. Platform embeds/links (YouTube/Vimeo/etc from iframes and <a> tags)
       2. Same-domain video page links (let yt-dlp handle them on clip)
       3. Direct video files from DOM (<video>, <source>)
-      4. Network-intercepted streams (HLS/MP4) — large ones only (skip preview blobs)
-    Hover scan removed: it only captures short hover-preview clips, not real videos.
+      4. Network-intercepted streams (HLS/MP4/DASH) — large ones only (skip preview blobs)
+      5. HLS/DASH manifests inferred from intercepted segment requests (.ts / .m4s)
+    Play buttons are clicked after page load to trigger stream requests.
     """
     deadline = time.time() + max_seconds
     net_direct = set()
+    net_manifests = set()  # inferred from HLS/DASH segment URLs
 
     def _on_response(response):
         try:
-            rurl  = response.url
-            ctype = response.headers.get("content-type", "")
-            if not (_VIDEO_MIME.search(ctype) or _VIDEO_EXTS.search(rurl.split("?")[0])):
+            rurl     = response.url
+            base_url = rurl.split("?")[0]
+            ctype    = response.headers.get("content-type", "")
+
+            # HLS segments (.ts / mp2t) → infer manifest, skip adding segment itself
+            if re.search(r'\.ts(\?|$)', base_url, re.I) or "mp2t" in ctype:
+                base_dir = base_url.rsplit("/", 1)[0]
+                for mname in ("index.m3u8", "playlist.m3u8", "master.m3u8"):
+                    net_manifests.add(f"{base_dir}/{mname}")
+                return
+
+            # DASH segments (.m4s) → infer manifest
+            if re.search(r'\.m4s(\?|$)', base_url, re.I):
+                base_dir = base_url.rsplit("/", 1)[0]
+                for mname in ("manifest.mpd", "index.mpd"):
+                    net_manifests.add(f"{base_dir}/{mname}")
+                return
+
+            if not (_VIDEO_MIME.search(ctype) or _VIDEO_EXTS.search(base_url)):
                 return
             if rurl.startswith("blob:"):
                 return
-            # Skip obvious hover/preview hint in URL
             if _PREVIEW_HINTS.search(rurl):
                 return
-            # Skip small files when content-length is known (likely preview clips)
             cl = response.headers.get("content-length", "")
             if cl and int(cl) < 500_000:
                 return
@@ -443,6 +507,9 @@ def _generic_crawl(page, url: str, max_seconds: int = 75) -> list:
     except Exception:
         return []
 
+    # Click play buttons to force stream URLs into network traffic
+    _click_play(page, deadline)
+
     page_title = _page_title(page)
 
     # DOM scan — (direct_files set, platform_urls set)
@@ -450,6 +517,9 @@ def _generic_crawl(page, url: str, max_seconds: int = 75) -> list:
 
     # Same-domain video page links
     page_links = _find_video_page_links(page, url)
+
+    # Merge inferred manifests into direct set
+    net_direct |= net_manifests
 
     # Merge direct-file URLs, deduplicate by stem
     all_direct = net_direct | dom_direct

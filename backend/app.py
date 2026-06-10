@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
 import os
+import re
 import sys
 import threading
+import zipfile
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -395,6 +398,58 @@ def render_cancel(render_id):
     evt.set()
     _renders.get(render_id, {}).update(status="cancelled", error="Cancelled by user")
     return jsonify({"ok": True})
+
+
+@app.post("/api/render-full")
+def render_full_start():
+    data   = request.get_json(force=True, silent=True) or {}
+    job_id = (data.get("job_id") or "").strip()
+    if not job_id or not jobs.get(job_id):
+        return jsonify({"error": "job_id required or not found."}), 400
+
+    render_id  = str(_uuid.uuid4())
+    cancel_evt = threading.Event()
+    _renders[render_id]        = {"status": "processing", "output": None,
+                                   "job_id": job_id, "error": None, "preview_only": False}
+    _render_cancels[render_id] = cancel_evt
+
+    def _run():
+        try:
+            out_name = clipper.render_full_video(job_id, cancel_event=cancel_evt)
+            if cancel_evt.is_set():
+                _renders[render_id].update(status="cancelled", error="Cancelled by user")
+            else:
+                _renders[render_id].update(status="ready", output=out_name)
+        except Exception as e:
+            msg = str(e)[-400:]
+            status = "cancelled" if "Cancelled" in msg else "failed"
+            _renders[render_id].update(status=status, error=msg)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"render_id": render_id}), 201
+
+
+@app.get("/api/download-zip/<job_id>")
+def download_zip(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found."}), 404
+    clips      = job.get("clips") or []
+    clip_dir   = os.path.join(jobs.CLIPS_DIR, job_id)
+    clip_paths = [(c, os.path.join(clip_dir, c)) for c in clips if os.path.isfile(os.path.join(clip_dir, c))]
+    if not clip_paths:
+        return jsonify({"error": "No rendered clips to zip."}), 404
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for name, path in clip_paths:
+            zf.write(path, name)
+    buf.seek(0)
+
+    raw_title  = re.sub(r"[^\w\s-]", "", job.get("title") or job_id)[:50].strip()
+    safe_title = re.sub(r"\s+", "_", raw_title) or job_id
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"{safe_title}_clips.zip")
 
 
 def _unsafe_path(name: str) -> bool:
