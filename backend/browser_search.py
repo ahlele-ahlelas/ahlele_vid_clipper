@@ -47,6 +47,7 @@ def search(
     username: str = None,
     password: str = None,
     cookie_out_path: str = None,
+    site: str = None,
 ) -> tuple:
     """
     Launch a Chromium browser, optionally log in, search/crawl, and return
@@ -54,10 +55,18 @@ def search(
     results is a list of {url, title, thumbnail, duration} dicts.
 
     source='facebook_page': query must be the Facebook page/profile URL.
+    source='site_search':   site is the website name/URL, query is the search term.
     """
     source = source.lower()
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+            ],
+        )
         ctx = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -65,7 +74,15 @@ def search(
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 800},
+            locale="en-US",
         )
+        # Basic stealth — hide the headless/automation tells most bot checks use
+        ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = window.chrome || { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        """)
         page = ctx.new_page()
         try:
             if source == "reddit":
@@ -76,6 +93,8 @@ def search(
                 results = _facebook_page(page, query, username, password)
             elif source == "crawl":
                 results = _generic_crawl(page, query)
+            elif source == "site_search":
+                results = _site_search(page, site or "", query)
             else:
                 results = []
 
@@ -443,7 +462,7 @@ def _click_play(page, deadline: float) -> None:
             pass
 
 
-def _generic_crawl(page, url: str, max_seconds: int = 75) -> list:
+def _generic_crawl(page, url: str, max_seconds: int = 75, query: str = None) -> list:
     """
     Crawl any webpage for full videos.
     Strategy order:
@@ -453,6 +472,8 @@ def _generic_crawl(page, url: str, max_seconds: int = 75) -> list:
       4. Network-intercepted streams (HLS/MP4/DASH) — large ones only (skip preview blobs)
       5. HLS/DASH manifests inferred from intercepted segment requests (.ts / .m4s)
     Play buttons are clicked after page load to trigger stream requests.
+    query: when set (site-search results page), links whose text matches the
+    query words are also collected even if their URL lacks /video/-style hints.
     """
     deadline = time.time() + max_seconds
     net_direct = set()
@@ -517,6 +538,11 @@ def _generic_crawl(page, url: str, max_seconds: int = 75) -> list:
 
     # Same-domain video page links
     page_links = _find_video_page_links(page, url)
+
+    # Search-results context: strict /video/-hint scan often misses listing
+    # links — fall back to query-word matching on anchor text.
+    if query and len(page_links) < 3:
+        page_links = page_links + _find_query_links(page, url, query)
 
     # Merge inferred manifests into direct set
     net_direct |= net_manifests
@@ -604,11 +630,376 @@ def _find_video_page_links(page, base_url: str) -> list:
                 title = el.inner_text()[:120].strip()
             except Exception:
                 title = ""
-            links.append({"url": full, "title": title or full, "thumbnail": "", "duration": 0})
+            links.append({"url": full, "title": title or _slug_title(full), "thumbnail": "", "duration": 0})
         except Exception:
             continue
 
     return links[:25]
+
+
+def _slug_title(url: str) -> str:
+    """Readable title from a URL slug: /video/ocean-waves-123/ → 'ocean waves'."""
+    path = urlparse(url).path.rstrip("/")
+    seg = path.rsplit("/", 1)[-1]
+    seg = re.sub(r"[-_]?\d{4,}$", "", seg)          # strip trailing numeric ids
+    seg = re.sub(r"[-_]+", " ", seg).strip()
+    return seg or url
+
+
+def _find_query_links(page, base_url: str, query: str) -> list:
+    """
+    Looser link scan for search-results pages: same-domain links whose anchor
+    text (or path) contains query words. Ranked by number of word hits.
+    """
+    words = [w for w in re.split(r"\W+", query.lower()) if len(w) > 2]
+    if not words:
+        return []
+    base_host = urlparse(base_url).netloc
+    scored = []
+    seen = set()
+
+    for el in page.locator("a[href]").all()[:400]:
+        try:
+            href = el.get_attribute("href") or ""
+            if not href.startswith(("http", "/")):
+                continue
+            full = urljoin(base_url, href)
+            parsed = urlparse(full)
+            if parsed.netloc != base_host:
+                continue
+            if _NAV_SKIP.search(parsed.path):
+                continue
+            key = full.split("#")[0].rstrip("/")
+            if key in seen or key == base_url.rstrip("/"):
+                continue
+            try:
+                text = el.inner_text()[:160].strip()
+            except Exception:
+                text = ""
+            if len(text) < 8:
+                continue
+            hay = (text + " " + parsed.path).lower()
+            hits = sum(1 for w in words if w in hay)
+            if hits == 0:
+                continue
+            seen.add(key)
+            scored.append((hits, {"url": full, "title": text[:120], "thumbnail": "", "duration": 0}))
+        except Exception:
+            continue
+
+    scored.sort(key=lambda t: -t[0])
+    return [entry for _, entry in scored[:15]]
+
+
+# ── Site-name + query search ───────────────────────────────────────────────────
+
+_SEARCH_INPUT_SELECTORS = [
+    'input[type="search"]',
+    'input[name="q"]',
+    'input[name="s"]',
+    'input[name="search"]',
+    'input[name="query"]',
+    'input[name="keyword"]',
+    'input[name="search_query"]',
+    'input[placeholder*="search" i]',
+    'input[aria-label*="search" i]',
+    'input[id*="search" i]',
+]
+
+# Buttons that reveal a hidden search input when clicked
+_SEARCH_TOGGLE_SELECTORS = [
+    'button[aria-label*="search" i]',
+    'a[aria-label*="search" i]',
+    '[class*="search-toggle" i]',
+    '[class*="search-icon" i]',
+    '[data-testid*="search" i]',
+]
+
+_COMMON_SEARCH_PATHS = [
+    "/search?q={q}",
+    "/search?query={q}",
+    "/?s={q}",                  # WordPress
+    "/search/{q}",
+    "/results?search_query={q}",
+    "/videos?q={q}",
+]
+
+
+def _resolve_site_candidates(site: str) -> list:
+    """Turn a site name ('dailymotion', 'pexels.com', full URL) into URL candidates."""
+    site = site.strip().lower()
+    if site.startswith(("http://", "https://")):
+        return [site.rstrip("/")]
+    site = site.replace(" ", "")
+    if "." in site:
+        cands = [f"https://{site}"]
+        if not site.startswith("www."):
+            cands.append(f"https://www.{site}")
+        return cands
+    return [f"https://www.{site}.com", f"https://{site}.com"]
+
+
+def _try_search_box(page, query: str, deadline: float) -> bool:
+    """Fill the site's own search input and submit. Returns True if URL changed."""
+    before = page.url
+
+    def _fill_and_submit(sel) -> bool:
+        try:
+            el = page.locator(sel).first
+            if el.count() == 0 or not el.is_visible(timeout=600):
+                return False
+            el.click(timeout=1500)
+            el.fill(query, timeout=2000)
+            el.press("Enter")
+            page.wait_for_timeout(2500)
+            try:
+                page.wait_for_load_state("networkidle", timeout=8_000)
+            except PwTimeout:
+                pass
+            return page.url.split("#")[0] != before.split("#")[0]
+        except Exception:
+            return False
+
+    for sel in _SEARCH_INPUT_SELECTORS:
+        if time.time() > deadline:
+            return False
+        if _fill_and_submit(sel):
+            return True
+
+    # Some sites hide the input behind a magnifier icon — click it, retry inputs
+    for tsel in _SEARCH_TOGGLE_SELECTORS:
+        if time.time() > deadline:
+            return False
+        try:
+            tog = page.locator(tsel).first
+            if tog.count() and tog.is_visible(timeout=500):
+                tog.click(timeout=1500)
+                page.wait_for_timeout(800)
+                for sel in _SEARCH_INPUT_SELECTORS:
+                    if _fill_and_submit(sel):
+                        return True
+                break
+        except Exception:
+            continue
+    return False
+
+
+def _scrape_engine_links(page, host: str, link_selector: str) -> list:
+    """Collect search-engine result links that point at the target host."""
+    results = []
+    seen = set()
+    for el in page.locator(link_selector).all()[:30]:
+        try:
+            href = el.get_attribute("href") or ""
+            if not href.startswith("http") or host not in urlparse(href).netloc:
+                continue
+            if href in seen:
+                continue
+            seen.add(href)
+            title = el.inner_text()[:120].strip()
+            results.append({"url": href, "title": title or _slug_title(href), "thumbnail": "", "duration": 0})
+        except Exception:
+            continue
+    return results[:15]
+
+
+def _ddg_site_search(page, host: str, query: str) -> list:
+    """DuckDuckGo HTML search restricted to the site's domain."""
+    host = host.replace("www.", "")
+    ddg = f"https://duckduckgo.com/html/?q={_enc(f'site:{host} {query}')}"
+    try:
+        page.goto(ddg, timeout=20_000)
+        page.wait_for_timeout(1500)
+    except Exception:
+        return []
+    return _scrape_engine_links(page, host, "a.result__a")
+
+
+def _bing_site_search(page, host: str, query: str) -> list:
+    """Bing search restricted to the site's domain."""
+    host = host.replace("www.", "")
+    bing = f"https://www.bing.com/search?q={_enc(f'site:{host} {query}')}"
+    try:
+        page.goto(bing, timeout=20_000)
+        page.wait_for_timeout(2500)
+    except Exception:
+        return []
+    return _scrape_engine_links(page, host, "li.b_algo h2 a")
+
+
+def _http_site_search(host: str, query: str) -> list:
+    """
+    site:<domain> search via DuckDuckGo over curl_cffi — real Chrome TLS
+    fingerprint survives bot checks that block headless Chromium.
+    """
+    try:
+        from curl_cffi import requests as creq
+    except ImportError:
+        return []
+    import html as _html
+    from urllib.parse import unquote, parse_qs
+
+    host = host.replace("www.", "")
+    try:
+        r = creq.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:{host} {query}"},
+            impersonate="chrome", timeout=20,
+        )
+        if r.status_code != 200:
+            return []
+        text = r.text
+    except Exception:
+        return []
+
+    results, seen = [], set()
+    for href, title_html in re.findall(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', text, re.S):
+        # DDG html wraps targets in a /l/?uddg= redirect
+        if href.startswith("//duckduckgo.com/l/"):
+            qs = parse_qs(urlparse("https:" + href).query)
+            href = unquote(qs.get("uddg", [""])[0])
+        if not href.startswith("http") or host not in urlparse(href).netloc:
+            continue
+        href = href.replace(" ", "%20")   # DDG returns unquoted target URLs
+        if href in seen:
+            continue
+        seen.add(href)
+        title = _html.unescape(re.sub(r"<[^>]+>", "", title_html)).strip()
+        results.append({"url": href, "title": title or _slug_title(href), "thumbnail": "", "duration": 0})
+
+    # Video-looking pages first
+    results.sort(key=lambda e: 0 if _VIDEO_PATH_HINT.search(urlparse(e["url"]).path) else 1)
+    return results[:15]
+
+
+def _engine_site_search(page, host: str, query: str) -> list:
+    """site:<domain> search: curl_cffi DDG first, then in-browser DDG, then Bing."""
+    results = _http_site_search(host, query)
+    if results:
+        return results
+    results = _ddg_site_search(page, host, query)
+    if results:
+        return results
+    return _bing_site_search(page, host, query)
+
+
+def _is_challenge_page(page) -> bool:
+    """Detect Cloudflare/Turnstile interstitials — no point crawling those."""
+    try:
+        t = (page.title() or "").lower()
+        if "just a moment" in t or "attention required" in t:
+            return True
+        body = page.evaluate("() => document.body.innerText.slice(0, 500).toLowerCase()")
+        return ("security verification" in body
+                or "verify you are" in body
+                or "checking your browser" in body
+                or "complete the following challenge" in body)
+    except Exception:
+        return False
+
+
+def _site_search(page, site: str, query: str, max_seconds: int = 110) -> list:
+    """
+    Open a website by name/URL, run the query through its search, and crawl
+    the results page for videos.
+    Strategy order:
+      1. Site's own search box (incl. hidden behind a magnifier icon)
+      2. Common search URL patterns (/search?q=, /?s=, …)
+      3. site:<domain> engine search (curl_cffi DDG → browser DDG → Bing)
+    Sites behind Cloudflare challenges skip straight to strategy 3.
+    """
+    if not site:
+        raise ValueError("site is required for site_search")
+    if not query:
+        raise ValueError("query is required for site_search")
+
+    deadline = time.time() + max_seconds
+
+    base = None
+    for cand in _resolve_site_candidates(site):
+        try:
+            page.goto(cand, timeout=20_000)
+            parsed = urlparse(page.url)
+            base = f"{parsed.scheme}://{parsed.netloc}"
+            break
+        except Exception:
+            continue
+    if not base:
+        raise ValueError(f"Could not reach site: {site}")
+
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=8_000)
+    except PwTimeout:
+        pass
+
+    # Cloudflare/Turnstile wall → the browser can't get in; engine search can
+    if _is_challenge_page(page):
+        return _engine_site_search(page, urlparse(base).netloc, query)
+
+    words = [w for w in re.split(r"\W+", query.lower()) if len(w) > 2]
+
+    def _body_mentions_query() -> bool:
+        try:
+            body = page.evaluate("() => document.body.innerText.slice(0, 30000).toLowerCase()")
+            return any(w in body for w in words)
+        except Exception:
+            return False
+
+    landed = _try_search_box(page, query, deadline)
+
+    if not landed:
+        # Common search-URL patterns. "Strong" landing = results page actually
+        # mentions the query (filters out sites that 200 a generic page).
+        weak_url = None
+        for tpl in _COMMON_SEARCH_PATHS:
+            if time.time() > deadline:
+                break
+            surl = base + tpl.format(q=_enc(query))
+            try:
+                resp = page.goto(surl, timeout=15_000)
+                if not resp or resp.status >= 400:
+                    continue
+                try:
+                    page.wait_for_load_state("networkidle", timeout=6_000)
+                except PwTimeout:
+                    pass
+                if _body_mentions_query():
+                    landed = True
+                    break
+                if weak_url is None:
+                    weak_url = page.url
+            except Exception:
+                continue
+        if not landed and weak_url:
+            try:
+                page.goto(weak_url, timeout=15_000)
+                landed = True
+            except Exception:
+                pass
+
+    if not landed:
+        return _engine_site_search(page, urlparse(base).netloc, query)
+
+    # Crawl the results page (re-navigates to attach network interception)
+    remaining = max(20, int(deadline - time.time()))
+    results = _generic_crawl(page, page.url, max_seconds=remaining, query=query)
+
+    def _relevance(entry) -> int:
+        hay = (entry.get("title", "") + " " + entry.get("url", "")).lower()
+        return sum(1 for w in words if w in hay)
+
+    if results:
+        relevant = [e for e in results if _relevance(e) > 0]
+        if relevant:
+            rest = [e for e in results if _relevance(e) == 0]
+            return relevant + rest
+        # Crawl found videos but none match the query (generic/popular page) —
+        # DDG site: search is more precise; keep raw results as backstop.
+        ddg = _engine_site_search(page, urlparse(base).netloc, query)
+        return ddg if ddg else results
+
+    return _engine_site_search(page, urlparse(base).netloc, query)
 
 
 def _match_platform(url: str) -> str | None:

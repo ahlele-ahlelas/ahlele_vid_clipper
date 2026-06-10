@@ -256,9 +256,12 @@ def browser_search_status(search_id):
 
 @app.post("/api/crawl")
 def crawl_start():
-    """Start a Playwright crawl on any URL to find video files."""
-    data = request.get_json(force=True, silent=True) or {}
-    url  = (data.get("url") or "").strip()
+    """Start a Playwright crawl on any URL to find video files.
+    With `query`, treats `url` as a site name/URL and runs the query through
+    the site's own search first (site_search mode)."""
+    data  = request.get_json(force=True, silent=True) or {}
+    url   = (data.get("url")   or "").strip()
+    query = (data.get("query") or "").strip()
     if not url:
         return jsonify({"error": "url required."}), 400
 
@@ -267,7 +270,10 @@ def crawl_start():
 
     def _run():
         try:
-            results, saved = bs.search("crawl", url, cookie_out_path=None)
+            if query:
+                results, _ = bs.search("site_search", query, site=url, cookie_out_path=None)
+            else:
+                results, _ = bs.search("crawl", url, cookie_out_path=None)
             _bsearches[search_id].update(status="ready", results=results, cookie_session_id=None)
         except Exception as e:
             _bsearches[search_id].update(status="failed", error=str(e))

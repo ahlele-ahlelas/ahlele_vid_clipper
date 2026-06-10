@@ -176,12 +176,25 @@ def _apply_browser_cookies(ydl_opts: dict, browser: str | None, cookiefile: str 
         ydl_opts["cookiesfrombrowser"] = (browser,)
 
 
+def _curl_cffi_available() -> bool:
+    try:
+        import curl_cffi  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+_BLOCKED_HINTS = ("403", "forbidden", "blocked", "impersonat", "429", "captcha", "cloudflare")
+
+
 def _ydl_extract(ydl_opts: dict, url: str, download: bool = False):
     """
     Run yt-dlp extract_info.
     - If DPAPI cookie-decryption fails (Chrome 127+ App-Bound Encryption),
       strip cookiesfrombrowser and retry without cookies.
     - If browser profile not found (server/Colab env), same fallback.
+    - If the site blocks the request (403/Cloudflare/captcha) and curl_cffi
+      is installed, retry with full browser TLS impersonation.
     Returns (info, browser_cookies_failed: bool).
     """
     log = _CaptureLogger()
@@ -210,9 +223,25 @@ def _ydl_extract(ydl_opts: dict, url: str, download: bool = False):
     # decryption errors that don't match known message patterns).
     if browser_cookie_fail or ("cookiesfrombrowser" in ydl_opts and exc is not None):
         retry_opts = {k: v for k, v in opts.items() if k != "cookiesfrombrowser"}
-        with yt_dlp.YoutubeDL(retry_opts) as ydl:
-            info = ydl.extract_info(url, download=download)
-        return info, True
+        try:
+            with yt_dlp.YoutubeDL(retry_opts) as ydl:
+                info = ydl.extract_info(url, download=download)
+            return info, True
+        except Exception as e:
+            exc = e
+            _combined += str(e).lower()
+
+    # Blocked by the site → retry impersonating a real Chrome TLS fingerprint
+    if exc is not None and any(h in _combined for h in _BLOCKED_HINTS) and _curl_cffi_available():
+        try:
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+            imp_opts = {k: v for k, v in opts.items() if k != "cookiesfrombrowser"}
+            imp_opts["impersonate"] = ImpersonateTarget("chrome")
+            with yt_dlp.YoutubeDL(imp_opts) as ydl:
+                info = ydl.extract_info(url, download=download)
+            return info, False
+        except Exception:
+            pass  # fall through to original error
 
     if exc is not None:
         raise exc
@@ -461,10 +490,7 @@ def render_full_video(job_id: str, cancel_event=None) -> str:
                         "format": fmt, "quiet": True, "no_warnings": True,
                         "merge_output_format": "mp4",
                         "outtmpl": raw_base + ".%(ext)s",
-                        "concurrent_fragment_downloads": 16,
-                        "buffersize": 1024 * 1024,
-                        "http_chunk_size": 10 * 1024 * 1024,
-                        "socket_timeout": 60,
+                        **_fast_dl_opts(),
                         "http_headers": _base_headers,
                         "progress_hooks": [_check_cancel],
                     }
@@ -562,10 +588,7 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None, pr
                 "format": range_fmt, "quiet": True, "no_warnings": True,
                 "outtmpl": tmp_prefix + ".%(ext)s",
                 "download_ranges": download_range_func(None, [(seg_start, seg_end_val)]),
-                "concurrent_fragment_downloads": 16,
-                "buffersize": 1024 * 1024,
-                "http_chunk_size": 10 * 1024 * 1024,
-                "socket_timeout": 60,
+                **_fast_dl_opts(),
                 "http_headers": _base_headers,
                 "progress_hooks": [_check_cancel],
             }
@@ -610,10 +633,7 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None, pr
                             "format": fmt, "quiet": True, "no_warnings": True,
                             "merge_output_format": "mp4",
                             "outtmpl": raw_base + ".%(ext)s",
-                            "concurrent_fragment_downloads": 16,
-                            "buffersize": 1024 * 1024,
-                            "http_chunk_size": 10 * 1024 * 1024,
-                            "socket_timeout": 60,
+                            **_fast_dl_opts(),
                             "http_headers": _base_headers,
                             "progress_hooks": [_check_cancel],
                         }
@@ -781,7 +801,7 @@ def convert_clip(job_id: str, clip_name: str, aspect_ratio: str, preview_only: b
     return out_name
 
 
-def _parallel_http_download(url: str, out_path: str, n_threads: int = 8,
+def _parallel_http_download(url: str, out_path: str, n_threads: int = 16,
                              headers: dict | None = None, cancel_event=None) -> bool:
     """
     Download url using N parallel HTTP range-request threads (IDM-style).
@@ -958,6 +978,19 @@ def _idm_download(url: str, save_dir: str, filename: str, timeout: int = 300) ->
             stable = 0
             last_size = sz
     return ""
+
+
+def _fast_dl_opts() -> dict:
+    """Shared yt-dlp tuning: parallel fragments, big buffers, aggressive retries."""
+    return {
+        "concurrent_fragment_downloads": 16,
+        "buffersize": 1024 * 1024,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "socket_timeout": 60,
+        "retries": 10,
+        "fragment_retries": 10,
+        "skip_unavailable_fragments": True,
+    }
 
 
 def _aria2c_available() -> bool:

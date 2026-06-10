@@ -126,7 +126,8 @@ function detectSourceType(input) {
   for (const { type, labels } of _SITE_MAP) {
     if (labels.some(l => t.includes(l))) return type;
   }
-  return 'auto';
+  // Unknown site name → browser crawler searches the site itself
+  return 'site';
 }
 
 function _siteEntry(type) {
@@ -149,32 +150,37 @@ function onSiteInputChange() {
 
   const entry = _siteEntry(detected);
   const isUrlOnly = entry && entry.urlOnly;
+  const queryInput = document.getElementById('searchQuery');
 
-  if (detected === 'url' || isUrlOnly) {
-    queryGroup.classList.add('hidden');
-    if (detected === 'url') {
-      badge.textContent = '🔗 Direct URL';
-      badge.className = 'site-badge badge-url';
-      if (hint) hint.classList.add('hidden');
-    } else {
-      badge.textContent = entry.icon;
-      badge.className = 'site-badge badge-site';
-      if (hint) {
-        const crawlable = entry.type === 'facebook';
-        hint.textContent = crawlable
-          ? `${entry.icon} — paste a page/profile URL to browse its videos, or paste a direct video URL to clip immediately.`
-          : `${entry.icon} doesn't support search — paste a direct video/reel/post URL above.`;
-        hint.classList.remove('hidden');
-      }
+  if (detected === 'url') {
+    // Keep query visible: URL + query = search that site via crawler
+    queryGroup.classList.remove('hidden');
+    queryInput.placeholder = 'Optional — search this site for a topic (leave empty to clip the URL directly)';
+    badge.textContent = '🔗 Direct URL';
+    badge.className = 'site-badge badge-url';
+    if (hint) hint.classList.add('hidden');
+  } else if (isUrlOnly) {
+    // Crawler can search these sites too — keep query visible
+    queryGroup.classList.remove('hidden');
+    queryInput.placeholder = 'What to search for on this site…';
+    badge.textContent = entry.icon;
+    badge.className = 'site-badge badge-site';
+    if (hint) {
+      const crawlable = entry.type === 'facebook';
+      hint.textContent = crawlable
+        ? `${entry.icon} — paste a page/profile URL to browse its videos, or paste a direct video URL to clip immediately.`
+        : `${entry.icon} — paste a direct video URL, or enter a query to search the site via the browser crawler.`;
+      hint.classList.remove('hidden');
     }
   } else {
     queryGroup.classList.remove('hidden');
+    queryInput.placeholder = 'What to search for on this site…';
     if (hint) hint.classList.add('hidden');
     if (entry) {
       badge.textContent = entry.icon;
       badge.className = 'site-badge badge-site';
     } else {
-      badge.textContent = '🔍 Auto-detect';
+      badge.textContent = '🌐 Site search (crawler)';
       badge.className = 'site-badge badge-auto';
     }
   }
@@ -192,10 +198,16 @@ async function findAndClip() {
   const detected = detectSourceType(siteVal);
   const entry = _siteEntry(detected);
 
-  // URL-only sites: siteInput must be a direct URL
+  // URL-only sites: direct URL preferred, but a query routes to the crawler
   if (entry && entry.urlOnly) {
     if (!isUrl(siteVal)) {
-      setStatus(`${entry.icon} requires a direct video URL — keyword search not supported. Paste the video URL above.`);
+      if (queryVal) {
+        const combined = context ? `${queryVal} ${context}` : queryVal;
+        await handleSiteSearch(siteVal, combined);
+        setLoading(false);
+        return;
+      }
+      setStatus(`${entry.icon} — paste a direct video URL, or enter a search query to crawl the site.`);
       setLoading(false);
       return;
     }
@@ -207,21 +219,29 @@ async function findAndClip() {
     }
     await handleDirectUrl(siteVal);
   } else if (detected === 'url') {
-    await handleDirectUrl(siteVal);
+    if (queryVal) {
+      // URL + query → search that site via the browser crawler
+      const combined = context ? `${queryVal} ${context}` : queryVal;
+      await handleSiteSearch(siteVal, combined);
+    } else {
+      await handleDirectUrl(siteVal);
+    }
   } else if (!queryVal) {
     setStatus('Please enter a search query.');
     setLoading(false);
     return;
   } else {
     const combined = context ? `${queryVal} ${context}` : queryVal;
-    const sourceType = detected === 'auto' ? 'auto' : detected;
 
-    if (['reddit', 'twitter'].includes(sourceType)) {
+    if (['reddit', 'twitter'].includes(detected)) {
       setLoading(false);
-      openLoginModal(sourceType, combined);
+      openLoginModal(detected, combined);
       return;
+    } else if (detected === 'site') {
+      // Unknown site name → open it, search the query, crawl results
+      await handleSiteSearch(siteVal, combined);
     } else {
-      await handleKeywords(combined, sourceType);
+      await handleKeywords(combined, detected);
     }
   }
 
@@ -240,15 +260,13 @@ async function handleDirectUrl(url) {
 
     // yt-dlp doesn't know this URL — fall back to Playwright crawler
     if (d.error && /unsupported url|not supported/i.test(d.error)) {
-      setStatus('yt-dlp unsupported — crawling page for video files…');
-      await handleCrawl(url);
+      await handleCrawl(url, 'yt-dlp can\'t handle this site — crawling page for video files…');
       return;
     }
 
     if (d.error) { setStatus('Error: ' + d.error); return; }
     if (!d.results || !d.results.length) {
-      setStatus('No video found at this URL — trying page crawl…');
-      await handleCrawl(url);
+      await handleCrawl(url, 'No video found via yt-dlp — crawling page for video files…');
       return;
     }
 
@@ -262,8 +280,28 @@ async function handleDirectUrl(url) {
   }
 }
 
-async function handleCrawl(url) {
-  setStatus('Crawling page for video files…');
+async function handleSiteSearch(site, query) {
+  setStatus(`Opening ${site} and searching "${query}"… (browser crawl, may take up to ~2 min)`);
+  try {
+    const res = await fetch('/api/crawl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: site, query }),
+    });
+    const d = await res.json();
+    if (d.error) { setStatus('Site search error: ' + d.error); return; }
+    // Fallback: nothing found on the site → regular YouTube search for "query site"
+    pollBrowserSearch(d.search_id, 'Site search', async () => {
+      setStatus(`Nothing found on ${site} — searching YouTube instead…`);
+      await handleKeywords(`${query} ${site}`, 'auto');
+    });
+  } catch (e) {
+    setStatus('Site search failed: ' + e.message);
+  }
+}
+
+async function handleCrawl(url, reason) {
+  setStatus(reason || 'Crawling page for video files…');
   try {
     const res = await fetch('/api/crawl', {
       method: 'POST',
@@ -594,6 +632,51 @@ function clearCompleted() {
   }
 }
 
+function _renderAllClips(jobId) {
+  const card = document.querySelector(`.video-card[data-job-id="${CSS.escape(jobId)}"]`);
+  if (!card) return;
+  card.querySelectorAll('.clip-item:not([data-rendered]) [data-action="download"]')
+    .forEach(b => { if (!b.disabled) b.click(); });
+}
+
+async function _downloadFullVideo(jobId, btn) {
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = 'Preparing…';
+  try {
+    const res = await fetch('/api/render-full', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({job_id: jobId}),
+    });
+    const d = await res.json();
+    if (d.error) {
+      btn.textContent = '✗ ' + d.error;
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 4000);
+      return;
+    }
+    const renderId = d.render_id;
+    const poll = setInterval(async () => {
+      try {
+        const s = await (await fetch(`/api/render/${encodeURIComponent(renderId)}`)).json();
+        if (s.status === 'ready') {
+          clearInterval(poll);
+          window.location.href = `/api/download/${encodeURIComponent(jobId)}/${encodeURIComponent(s.output)}`;
+          btn.textContent = orig;
+          btn.disabled = false;
+        } else if (s.status === 'failed' || s.status === 'cancelled') {
+          clearInterval(poll);
+          btn.textContent = '✗ Failed';
+          setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 4000);
+        }
+      } catch (_) { clearInterval(poll); btn.textContent = orig; btn.disabled = false; }
+    }, 2000);
+  } catch (e) {
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+}
+
 // ── Polling ────────────────────────────────────────────────────────────────────
 function startPoll(jobId, card) {
   const id = setInterval(async () => {
@@ -615,6 +698,7 @@ function startPoll(jobId, card) {
 }
 
 function updateCard(card, job) {
+  card.dataset.jobId = job.id;
   const fill        = card.querySelector('.progress-fill');
   const statusEl    = card.querySelector('.card-status');
   const clipsEl     = card.querySelector('.card-clips');
@@ -638,7 +722,17 @@ function updateCard(card, job) {
 
     if (pending.length > 0) {
       // Lazy-render mode: show all segments, download/render on demand
-      clipsEl.innerHTML = `<div class="clips-label">Clips (${pending.length})</div><div class="clips-list"></div>`;
+      const jid = escHtml(job.id);
+      clipsEl.innerHTML = `
+        <div class="clips-header-row">
+          <span class="clips-label">Clips (${pending.length})</span>
+          <div class="clips-bulk-actions">
+            <button class="btn-ghost btn-xs" onclick="_renderAllClips('${jid}')">⟳ Render All</button>
+            <a class="btn-ghost btn-xs" href="/api/download-zip/${encodeURIComponent(job.id)}" download>⬇ All ZIP</a>
+            <button class="btn-ghost btn-xs" id="fullvid-${jid}" onclick="_downloadFullVideo('${jid}', this)">↓ Full Video</button>
+          </div>
+        </div>
+        <div class="clips-list"></div>`;
       const list = clipsEl.querySelector('.clips-list');
       pending.forEach((seg, idx) => {
         list.appendChild(_buildClipItem(job.id, seg, idx, rendered.has(seg.key)));
@@ -932,7 +1026,7 @@ function showLoginError(msg) {
   el.classList.remove('hidden');
 }
 
-function pollBrowserSearch(searchId, label = 'Browser search') {
+function pollBrowserSearch(searchId, label = 'Browser search', onEmpty = null) {
   const iv = setInterval(async () => {
     try {
       const res = await fetch(`/api/browser-search/${encodeURIComponent(searchId)}`);
@@ -941,6 +1035,7 @@ function pollBrowserSearch(searchId, label = 'Browser search') {
         clearInterval(iv);
         if (d.cookie_session_id) state.cookieSessionId = d.cookie_session_id;
         if (!d.results || !d.results.length) {
+          if (onEmpty) { onEmpty(); return; }
           setStatus('No videos found.');
           showEmptyResults('No videos found on this page.');
           return;
@@ -949,6 +1044,7 @@ function pollBrowserSearch(searchId, label = 'Browser search') {
         setStatus(`Found ${d.results.length} video${d.results.length !== 1 ? 's' : ''}. Click "Clip" to start.`);
       } else if (d.status === 'failed') {
         clearInterval(iv);
+        if (onEmpty) { onEmpty(); return; }
         setStatus(`${label} failed: ` + (d.error || 'Unknown error'));
       }
     } catch (_) {}

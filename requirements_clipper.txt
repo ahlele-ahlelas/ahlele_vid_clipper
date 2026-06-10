@@ -1,5 +1,10 @@
 flask
 flask-cors
 yt-dlp
+curl_cffi
 playwright
 pyngrok
+streamlink
+gallery-dl
+# Optional speed boost: install aria2 binary (winget install aria2.aria2)
+# yt-dlp auto-uses it for 16-connection downloads when found on PATH.
