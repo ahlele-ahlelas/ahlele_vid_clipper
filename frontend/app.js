@@ -469,7 +469,23 @@ function renderSearchResults(videos) {
   videos.forEach(video => {
     const card = buildSearchCard(video);
     addCard(card);
+    // Crawl/site-search results have no thumbnail — fetch og:image lazily
+    if (!video.thumbnail && isUrl(video.url)) lazyThumb(card, video.url);
   });
+}
+
+async function lazyThumb(card, url) {
+  try {
+    const res = await fetch(`/api/thumbnail?url=${encodeURIComponent(url)}`);
+    const d = await res.json();
+    if (!d.thumbnail) return;
+    const wrap = card.querySelector('.card-thumb');
+    if (!wrap) return;
+    wrap.innerHTML =
+      `<img src="${escHtml(d.thumbnail)}" alt="" loading="lazy" ` +
+      `onerror="this.parentElement.innerHTML='<div class=\\'thumb-placeholder\\'>🎬</div>'">`;
+    if (card._videoData) card._videoData.thumbnail = d.thumbnail;
+  } catch (_) {}
 }
 
 function buildSearchCard(video) {

@@ -596,6 +596,35 @@ _NAV_SKIP = re.compile(
 )
 
 
+_THUMB_IMG_ATTRS = ("src", "data-src", "data-lazy-src", "data-original", "data-thumb", "srcset")
+
+
+def _anchor_thumb(el, base_url: str) -> str:
+    """Grab a poster image from inside (or right beside) a result anchor."""
+    try:
+        img = el.locator("img").first
+        if img.count() == 0:
+            # Some listings put the thumb in a sibling/ancestor, not the <a>
+            img = el.locator("xpath=ancestor-or-self::*[1]//img").first
+            if img.count() == 0:
+                return ""
+        for attr in _THUMB_IMG_ATTRS:
+            raw = img.get_attribute(attr) or ""
+            raw = raw.strip()
+            if not raw or raw.startswith("data:"):
+                continue
+            if attr == "srcset":            # "url1 1x, url2 2x" → take first url
+                raw = raw.split(",")[0].strip().split(" ")[0]
+            if raw.startswith("//"):
+                raw = "https:" + raw
+            full = urljoin(base_url, raw)
+            if full.startswith("http"):
+                return full
+    except Exception:
+        pass
+    return ""
+
+
 def _find_video_page_links(page, base_url: str) -> list:
     """
     Find <a> links that explicitly look like individual video pages
@@ -630,7 +659,8 @@ def _find_video_page_links(page, base_url: str) -> list:
                 title = el.inner_text()[:120].strip()
             except Exception:
                 title = ""
-            links.append({"url": full, "title": title or _slug_title(full), "thumbnail": "", "duration": 0})
+            links.append({"url": full, "title": title or _slug_title(full),
+                          "thumbnail": _anchor_thumb(el, base_url), "duration": 0})
         except Exception:
             continue
 
@@ -683,7 +713,8 @@ def _find_query_links(page, base_url: str, query: str) -> list:
             if hits == 0:
                 continue
             seen.add(key)
-            scored.append((hits, {"url": full, "title": text[:120], "thumbnail": "", "duration": 0}))
+            scored.append((hits, {"url": full, "title": text[:120],
+                                  "thumbnail": _anchor_thumb(el, base_url), "duration": 0}))
         except Exception:
             continue
 

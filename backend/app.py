@@ -106,6 +106,19 @@ def search():
     return jsonify({"results": results})
 
 
+@app.get("/api/thumbnail")
+def thumbnail():
+    """Scrape og:image for a result URL (crawl/site-search cards lack thumbnails)."""
+    url = (request.args.get("url") or "").strip()
+    if not url or not url.startswith("http"):
+        return jsonify({"thumbnail": ""})
+    try:
+        thumb = clipper.fetch_thumbnail(url)
+    except Exception:
+        thumb = ""
+    return jsonify({"thumbnail": thumb})
+
+
 @app.post("/api/clip")
 def clip():
     if not FFMPEG_OK:

@@ -345,6 +345,72 @@ def fetch_metadata(query: str, source_type: str = "auto", browser: str | None = 
     return []
 
 
+_OG_IMAGE_PROPS = (
+    "og:image:secure_url", "og:image:url", "og:image",
+    "twitter:image:src", "twitter:image",
+)
+
+
+def fetch_thumbnail(url: str) -> str:
+    """
+    Return a poster image URL for a video page by scraping its og:image /
+    twitter:image meta tags. Used for crawl/site-search results that have no
+    thumbnail from the extractor. Lightweight HTTP — no browser, no yt-dlp.
+    """
+    if not url or not url.startswith("http"):
+        return ""
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    html = ""
+    # curl_cffi first (real Chrome TLS beats bot walls), then stdlib fallback
+    if _curl_cffi_available():
+        try:
+            from curl_cffi import requests as creq
+            r = creq.get(url, headers=headers, impersonate="chrome", timeout=10)
+            if r.status_code == 200:
+                html = r.text
+        except Exception:
+            html = ""
+    if not html:
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read(200_000).decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    # Only need the <head> — meta tags live there; cap work on huge pages
+    head = html[:200_000]
+    for prop in _OG_IMAGE_PROPS:
+        p = re.escape(prop)
+        m = re.search(
+            rf'<meta[^>]+(?:property|name)=["\']{p}["\'][^>]*\bcontent=["\']([^"\']+)["\']',
+            head, re.I,
+        ) or re.search(
+            rf'<meta[^>]+\bcontent=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']{p}["\']',
+            head, re.I,
+        )
+        if m:
+            thumb = m.group(1).strip()
+            if thumb.startswith("//"):
+                thumb = "https:" + thumb
+            elif thumb.startswith("/"):
+                from urllib.parse import urljoin
+                thumb = urljoin(url, thumb)
+            if thumb.startswith("http"):
+                return thumb
+    return ""
+
+
 def download_and_clip(job_id: str) -> None:
     """
     Phase 1 only: fetch video metadata, calculate clip segments, mark job ready.
