@@ -14,17 +14,21 @@ import uuid as _uuid
 
 import jobs
 import clipper
+import effects
 import browser_search as bs
 from utils import check_ffmpeg
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 COOKIES_DIR = os.path.join(BASE_DIR, "tmp", "cookies")
+LOGOS_DIR = os.path.join(BASE_DIR, "tmp", "logos")
 
 _conversions: dict = {}      # conv_id -> {status, output, job_id, error}
 _renders: dict       = {}   # render_id -> {status, output, job_id, error}
 _render_cancels: dict = {}  # render_id -> threading.Event
 _cookie_sessions: dict = {}  # session_id -> file_path
+_logo_sessions: dict = {}    # logo_id -> file_path
+_fx: dict = {}               # fx_id -> {status, output, extra, job_id, error, kind}
 
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
 CORS(app)
@@ -446,6 +450,114 @@ def render_full_start():
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"render_id": render_id}), 201
+
+
+@app.post("/api/logo")
+def upload_logo():
+    """Upload a logo image for the overlay effect. Returns logo_id (1h TTL)."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided."}), 400
+    f = request.files["file"]
+    ext = (f.filename or "").rsplit(".", 1)[-1].lower()
+    if ext not in ("png", "jpg", "jpeg", "webp", "bmp"):
+        return jsonify({"error": "Logo must be png/jpg/webp/bmp."}), 400
+
+    os.makedirs(LOGOS_DIR, exist_ok=True)
+    logo_id = str(_uuid.uuid4())
+    path = os.path.join(LOGOS_DIR, f"{logo_id}.{ext}")
+    f.save(path)
+    _logo_sessions[logo_id] = path
+
+    def _cleanup():
+        _logo_sessions.pop(logo_id, None)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    t = threading.Timer(3600, _cleanup)
+    t.daemon = True
+    t.start()
+    return jsonify({"logo_id": logo_id}), 201
+
+
+_FX_KINDS = {"captions", "overlay", "trim-silence", "gif", "mp3", "smart-crop", "face-scan"}
+
+
+@app.post("/api/fx/<kind>")
+def fx_start(kind):
+    """Run a creator effect on a rendered clip. Async — poll GET /api/fx/<fx_id>."""
+    if kind not in _FX_KINDS:
+        return jsonify({"error": f"Unknown effect. Valid: {sorted(_FX_KINDS)}"}), 404
+    if not FFMPEG_OK:
+        return jsonify({"error": "FFmpeg not installed."}), 500
+
+    data      = request.get_json(force=True, silent=True) or {}
+    job_id    = (data.get("job_id")    or "").strip()
+    clip_name = (data.get("clip_name") or "").strip()
+    if not job_id or not clip_name:
+        return jsonify({"error": "job_id and clip_name required."}), 400
+    if _unsafe_path(clip_name):
+        return jsonify({"error": "Invalid filename."}), 400
+
+    fx_id = str(_uuid.uuid4())
+    _fx[fx_id] = {"status": "processing", "output": None, "extra": {},
+                  "job_id": job_id, "error": None, "kind": kind}
+
+    def _run():
+        try:
+            extra = {}
+            if kind == "captions":
+                out, srt = effects.generate_captions(
+                    job_id, clip_name,
+                    burn=bool(data.get("burn", True)),
+                    model_size=(data.get("model_size") or ""),
+                    language=(data.get("language") or ""),
+                )
+                extra["srt"] = srt
+            elif kind == "overlay":
+                logo_id = (data.get("logo_id") or "").strip()
+                out = effects.overlay_clip(
+                    job_id, clip_name,
+                    text=(data.get("text") or ""),
+                    text_pos=(data.get("text_pos") or "bottom"),
+                    logo_path=_logo_sessions.get(logo_id, "") if logo_id else "",
+                    logo_pos=(data.get("logo_pos") or "top_right"),
+                )
+            elif kind == "trim-silence":
+                out = effects.trim_silence(job_id, clip_name)
+            elif kind == "gif":
+                out = effects.export_gif(job_id, clip_name)
+            elif kind == "mp3":
+                out = effects.export_mp3(job_id, clip_name)
+            elif kind == "face-scan":
+                out = None
+                extra["faces"] = effects.scan_faces(job_id, clip_name)
+            else:  # smart-crop
+                face_ids = data.get("face_ids") or None
+                if face_ids is not None:
+                    face_ids = [int(i) for i in face_ids]
+                out = effects.smart_convert(
+                    job_id, clip_name, (data.get("aspect_ratio") or "9:16"),
+                    face_ids=face_ids)
+
+            # Register outputs on the job so ZIP download includes them
+            if jobs.get(job_id):
+                for name in filter(None, [out, extra.get("srt")]):
+                    clipper._add_clip_to_job(job_id, name)
+            _fx[fx_id].update(status="ready", output=out, extra=extra)
+        except Exception as e:
+            _fx[fx_id].update(status="failed", error=str(e)[-400:])
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"fx_id": fx_id}), 201
+
+
+@app.get("/api/fx/<fx_id>")
+def fx_status(fx_id):
+    s = _fx.get(fx_id)
+    if not s:
+        return jsonify({"error": "Not found."}), 404
+    return jsonify({**s, "fx_id": fx_id})
 
 
 @app.get("/api/download-zip/<job_id>")

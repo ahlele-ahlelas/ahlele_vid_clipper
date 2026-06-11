@@ -6,5 +6,7 @@ playwright
 pyngrok
 streamlink
 gallery-dl
+faster-whisper
+opencv-python-headless
 # Optional speed boost: install aria2 binary (winget install aria2.aria2)
 # yt-dlp auto-uses it for 16-connection downloads when found on PATH.

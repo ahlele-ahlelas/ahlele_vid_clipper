@@ -793,19 +793,13 @@ function _buildClipItem(jobId, seg, idx, isRendered) {
   topRow.appendChild(actionsEl);
   item.appendChild(topRow);
 
-  // Ratio row + conv-results (hidden until rendered)
-  const ratioRow = document.createElement('div');
-  ratioRow.className = 'ratio-row hidden';
-  item.appendChild(ratioRow);
-
+  // Modify panels are created on demand (🛠 button); results list always present
   const convResults = document.createElement('div');
   convResults.className = 'conv-results';
   item.appendChild(convResults);
 
   if (isRendered) {
     _fillRenderedActions(actionsEl, jobId, seg.key);
-    _fillRatioRow(ratioRow, jobId, seg.key);
-    ratioRow.classList.remove('hidden');
   } else {
     _fillPendingActions(actionsEl, jobId, seg, idx, item);
   }
@@ -852,6 +846,7 @@ function _fillRenderedActions(actionsEl, jobId, clipName) {
 
   actionsEl.appendChild(prevBtn);
   actionsEl.appendChild(dlLink);
+  actionsEl.appendChild(_modifyBtn(jobId, clipName));
 }
 
 function _fillRatioRow(ratioRow, jobId, clipName) {
@@ -881,14 +876,10 @@ function _upgradeClipItem(item, jobId, seg, fromPreview = false) {
 
       actionsEl.appendChild(replayBtn);
       actionsEl.appendChild(dlBtn);
+      actionsEl.appendChild(_modifyBtn(jobId, seg.key));
     } else {
       _fillRenderedActions(actionsEl, jobId, seg.key);
     }
-  }
-  const ratioRow = item.querySelector('.ratio-row');
-  if (ratioRow) {
-    _fillRatioRow(ratioRow, jobId, seg.key);
-    ratioRow.classList.remove('hidden');
   }
 }
 
@@ -1074,6 +1065,22 @@ document.addEventListener('keydown', e => {
 
 // ── Aspect ratio conversion ────────────────────────────────────────────────────
 async function convertClip(btn, jobId, clipName) {
+  // Selected faces → track those; Track-largest checked → track biggest face;
+  // else plain center-crop convert.
+  // (scope to this clip's mod-panel — one clip-item can hold several panels)
+  const _scope = btn.closest('.mod-panel') || btn.closest('.clip-item');
+  const _faceIds = _selectedFaceIds(_scope);
+  if (_faceIds.length) {
+    runFx(btn, jobId, clipName, 'smart-crop',
+          { aspect_ratio: btn.dataset.ratio, face_ids: _faceIds });
+    return;
+  }
+  const _track = _scope && _scope.querySelector('.fx-track-toggle');
+  if (_track && _track.checked) {
+    runFx(btn, jobId, clipName, 'smart-crop', { aspect_ratio: btn.dataset.ratio });
+    return;
+  }
+
   btn.disabled = true;
   const ratio = btn.dataset.ratio;
   btn.textContent = '…';
@@ -1124,6 +1131,7 @@ function pollConversion(convId, btn, jobId) {
 
           wrap.appendChild(previewBtn);
           wrap.appendChild(saveBtn);
+          wrap.appendChild(_modifyBtn(jobId, d.output, true));
           convResults.appendChild(wrap);
         }
         btn.textContent = btn.dataset.ratio;
@@ -1184,6 +1192,273 @@ async function _saveConversion(btn, jobId, clipName, ratio) {
     btn.title = e.message;
     btn.disabled = false;
   }
+}
+
+// ── Creator tools (fx) ─────────────────────────────────────────────────────────
+function _modifyBtn(jobId, clipName, compact = false) {
+  const btn = document.createElement('button');
+  btn.className = compact ? 'btn-ghost conv-preview-btn' : 'btn-ghost';
+  btn.textContent = compact ? '🛠' : '🛠 Modify';
+  btn.title = `Convert / caption / trim / export ${clipName}`;
+  btn.addEventListener('click', () => _toggleModPanel(btn, jobId, clipName));
+  return btn;
+}
+
+function _toggleModPanel(btn, jobId, clipName) {
+  const item = btn.closest('.clip-item');
+  if (!item) return;
+  let panel = item.querySelector(`.mod-panel[data-clip="${CSS.escape(clipName)}"]`);
+  if (!panel) {
+    panel = _buildModPanel(jobId, clipName);
+    panel.dataset.clip = clipName;
+    item.insertBefore(panel, item.querySelector('.conv-results'));
+    return;
+  }
+  panel.classList.toggle('hidden');
+}
+
+function _buildModPanel(jobId, clipName) {
+  const panel = document.createElement('div');
+  panel.className = 'mod-panel';
+
+  const target = document.createElement('div');
+  target.className = 'mod-target';
+  target.textContent = `🛠 ${clipName}`;
+  panel.appendChild(target);
+
+  const ratioRow = document.createElement('div');
+  ratioRow.className = 'ratio-row';
+  panel.appendChild(ratioRow);
+
+  const fxRow = document.createElement('div');
+  fxRow.className = 'fx-row ratio-row';
+  panel.appendChild(fxRow);
+
+  const fxForm = document.createElement('div');
+  fxForm.className = 'fx-form hidden';
+  panel.appendChild(fxForm);
+
+  const faceChips = document.createElement('div');
+  faceChips.className = 'face-chips hidden';
+  panel.appendChild(faceChips);
+
+  _fillRatioRow(ratioRow, jobId, clipName);
+  _fillFxRow(fxRow, fxForm, jobId, clipName);
+  return panel;
+}
+
+function _fillFxRow(fxRow, fxForm, jobId, clipName) {
+  const jid = escHtml(jobId), cn = escHtml(clipName);
+  fxRow.innerHTML = `<span class="ratio-label">Tools:</span>` +
+    `<select class="fx-lang" title="Caption language — Auto detects, or pin the spoken language for accurate script">` +
+      `<option value="">🌐 Auto</option><option value="hi">हिन्दी</option><option value="en">English</option>` +
+    `</select>` +
+    `<button class="ratio-btn fx-btn" onclick="_runCaptions(this,'${jid}','${cn}')" title="Auto-transcribe speech and burn subtitles in the spoken language (first run downloads the Whisper model — slow once)">💬 Captions</button>` +
+    `<button class="ratio-btn fx-btn" onclick="runFx(this,'${jid}','${cn}','trim-silence')" title="Cut silent gaps out of the clip">🤫 Trim Silence</button>` +
+    `<button class="ratio-btn fx-btn" onclick="runFx(this,'${jid}','${cn}','gif')" title="Export as looping GIF (clips ≤60s)">🖼 GIF</button>` +
+    `<button class="ratio-btn fx-btn" onclick="runFx(this,'${jid}','${cn}','mp3')" title="Extract audio as MP3">🎵 MP3</button>` +
+    `<button class="ratio-btn fx-btn" onclick="_toggleFxForm(this)" title="Burn a title and/or logo onto the clip">📝 Text/Logo</button>` +
+    `<button class="ratio-btn fx-btn" onclick="_scanFaces(this,'${jid}','${cn}')" title="Detect everyone in the clip, then pick which face(s) the aspect-ratio crop should follow">👥 Pick faces</button>` +
+    `<label class="fx-track" title="When checked, the aspect-ratio buttons follow the largest detected face instead of center-cropping"><input type="checkbox" class="fx-track-toggle"> 🎯 Track largest</label>`;
+
+  fxForm.innerHTML =
+    `<input type="text" class="fx-text" placeholder="Title text…" maxlength="120">` +
+    `<select class="fx-text-pos"><option value="bottom">Text ↓</option><option value="top">Text ↑</option><option value="center">Text ·</option></select>` +
+    `<label class="ratio-btn fx-logo-label">🖼 Logo<input type="file" class="fx-logo" accept="image/png,image/jpeg,image/webp,image/bmp" hidden></label>` +
+    `<span class="fx-logo-name"></span>` +
+    `<select class="fx-logo-pos"><option value="top_right">Logo ↗</option><option value="top_left">Logo ↖</option><option value="bottom_right">Logo ↘</option><option value="bottom_left">Logo ↙</option></select>` +
+    `<button class="ratio-btn fx-apply" onclick="_applyOverlay(this,'${jid}','${cn}')">Apply</button>`;
+
+  fxForm.querySelector('.fx-logo').addEventListener('change', e => {
+    const f = e.target.files[0];
+    fxForm.querySelector('.fx-logo-name').textContent = f ? truncate(f.name, 18) : '';
+  });
+}
+
+async function _scanFaces(btn, jobId, clipName) {
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = 'Scanning…';
+  btn.classList.remove('ratio-btn-done', 'ratio-btn-failed');
+  btn.classList.add('ratio-btn-loading');
+  try {
+    const res = await fetch('/api/fx/face-scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: jobId, clip_name: clipName }),
+    });
+    const d = await res.json();
+    if (d.error) { _fxFail(btn, orig, d.error); return; }
+
+    const iv = setInterval(async () => {
+      try {
+        const s = await (await fetch(`/api/fx/${encodeURIComponent(d.fx_id)}`)).json();
+        if (s.status === 'ready') {
+          clearInterval(iv);
+          btn.classList.remove('ratio-btn-loading');
+          btn.classList.add('ratio-btn-done');
+          btn.textContent = orig;
+          btn.disabled = false;
+          _showFaceChips(btn, s.extra && s.extra.faces || []);
+        } else if (s.status === 'failed') {
+          clearInterval(iv);
+          _fxFail(btn, orig, s.error || 'Face scan failed');
+        }
+      } catch (_) {}
+    }, 2000);
+  } catch (e) {
+    _fxFail(btn, orig, e.message);
+  }
+}
+
+function _showFaceChips(btn, faces) {
+  const panel = btn.closest('.mod-panel');
+  const wrap = panel && panel.querySelector('.face-chips');
+  if (!wrap) return;
+  wrap.innerHTML = `<span class="face-chips-hint">Select face(s) to follow, then click an aspect ratio:</span>`;
+  faces.forEach(f => {
+    const chip = document.createElement('label');
+    chip.className = 'face-chip';
+    chip.title = `Seen in ${f.coverage}% of the clip (${f.appearances} detections)`;
+    chip.innerHTML =
+      `<input type="checkbox" data-fid="${f.face_id}">` +
+      (f.thumb ? `<img src="${f.thumb}" alt="face ${f.face_id}">` : `<span class="face-chip-fallback">👤</span>`) +
+      `<span>${f.coverage}%</span>`;
+    wrap.appendChild(chip);
+  });
+  wrap.classList.remove('hidden');
+}
+
+function _selectedFaceIds(scope) {
+  if (!scope) return [];
+  return [...scope.querySelectorAll('.face-chip input:checked')]
+    .map(i => parseInt(i.dataset.fid, 10));
+}
+
+function _runCaptions(btn, jobId, clipName) {
+  const row = btn.closest('.fx-row');
+  const lang = row ? (row.querySelector('.fx-lang') || {}).value || '' : '';
+  runFx(btn, jobId, clipName, 'captions', { language: lang });
+}
+
+function _toggleFxForm(btn) {
+  const scope = btn.closest('.mod-panel') || btn.closest('.clip-item');
+  const form = scope && scope.querySelector('.fx-form');
+  if (form) form.classList.toggle('hidden');
+}
+
+async function runFx(btn, jobId, clipName, kind, payload = {}) {
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '…';
+  btn.classList.remove('ratio-btn-done', 'ratio-btn-failed');
+  btn.classList.add('ratio-btn-loading');
+  try {
+    const res = await fetch(`/api/fx/${kind}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: jobId, clip_name: clipName, ...payload }),
+    });
+    const d = await res.json();
+    if (d.error) { _fxFail(btn, orig, d.error); return; }
+    _pollFx(d.fx_id, btn, orig, jobId);
+  } catch (e) {
+    _fxFail(btn, orig, e.message);
+  }
+}
+
+function _fxFail(btn, orig, msg) {
+  btn.classList.remove('ratio-btn-loading');
+  btn.classList.add('ratio-btn-failed');
+  btn.textContent = orig;
+  btn.title = msg;
+  btn.disabled = false;
+  const item = btn.closest('.clip-item');
+  if (item) {
+    let errEl = item.querySelector('.conv-error');
+    if (!errEl) {
+      errEl = document.createElement('div');
+      errEl.className = 'conv-error';
+      item.appendChild(errEl);
+    }
+    errEl.textContent = (msg || 'Effect failed').slice(0, 200);
+  }
+}
+
+function _pollFx(fxId, btn, orig, jobId) {
+  const iv = setInterval(async () => {
+    try {
+      const d = await (await fetch(`/api/fx/${encodeURIComponent(fxId)}`)).json();
+      if (d.status === 'ready') {
+        clearInterval(iv);
+        btn.classList.remove('ratio-btn-loading');
+        btn.classList.add('ratio-btn-done');
+        btn.textContent = orig;
+        btn.disabled = false;
+        _addFxResult(btn, jobId, d);
+      } else if (d.status === 'failed') {
+        clearInterval(iv);
+        _fxFail(btn, orig, d.error || 'Effect failed');
+      }
+    } catch (_) {}
+  }, 2000);
+}
+
+function _addFxResult(btn, jobId, d) {
+  const item = btn.closest('.clip-item');
+  const convResults = item && item.querySelector('.conv-results');
+  if (!convResults) return;
+  const row = document.createElement('div');
+  row.className = 'conv-result-row';
+  const files = [d.output, d.extra && d.extra.srt].filter(Boolean);
+  files.forEach(name => {
+    if (name.endsWith('.mp4')) {
+      const p = document.createElement('button');
+      p.className = 'btn-ghost conv-preview-btn';
+      p.textContent = '▶';
+      p.title = `Preview ${name}`;
+      p.onclick = () => previewClip(jobId, name);
+      row.appendChild(p);
+      row.appendChild(_modifyBtn(jobId, name, true));
+    }
+    const a = document.createElement('a');
+    a.className = 'btn-ghost conv-save-btn';
+    a.href = `/api/download/${encodeURIComponent(jobId)}/${encodeURIComponent(name)}`;
+    a.download = name;
+    a.title = name;
+    a.textContent = `↓ ${name.length > 30 ? '…' + name.slice(-27) : name}`;
+    row.appendChild(a);
+  });
+  convResults.appendChild(row);
+}
+
+async function _applyOverlay(btn, jobId, clipName) {
+  const form = btn.closest('.fx-form');
+  const text = form.querySelector('.fx-text').value.trim();
+  const logoFile = form.querySelector('.fx-logo').files[0];
+  if (!text && !logoFile) {
+    _fxFail(btn, 'Apply', 'Enter title text or choose a logo image.');
+    return;
+  }
+  let logo_id = null;
+  if (logoFile) {
+    const fd = new FormData();
+    fd.append('file', logoFile);
+    try {
+      const d = await (await fetch('/api/logo', { method: 'POST', body: fd })).json();
+      if (d.error) { _fxFail(btn, 'Apply', d.error); return; }
+      logo_id = d.logo_id;
+    } catch (e) {
+      _fxFail(btn, 'Apply', e.message);
+      return;
+    }
+  }
+  runFx(btn, jobId, clipName, 'overlay', {
+    text,
+    text_pos: form.querySelector('.fx-text-pos').value,
+    logo_id,
+    logo_pos: form.querySelector('.fx-logo-pos').value,
+  });
 }
 
 // ── Modal ──────────────────────────────────────────────────────────────────────

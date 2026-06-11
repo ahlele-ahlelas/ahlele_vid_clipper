@@ -793,3 +793,108 @@ select option { background: #222; }
   .results-grid { grid-template-columns: 1fr; }
   .queue-btns { flex-direction: column; gap: 6px; }
 }
+
+/* ── Creator tools (fx) ────────────────────────────────────── */
+.mod-panel {
+  margin-top: 6px;
+  padding: 6px 10px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.mod-panel .ratio-row { border-top: none; padding-top: 0; }
+.mod-target {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 2px;
+}
+.fx-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+.fx-form .fx-text {
+  flex: 1 1 140px;
+  min-width: 120px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 0.75rem;
+  font-family: var(--font);
+}
+.fx-row .fx-lang,
+.fx-form select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 0.72rem;
+  font-family: var(--font);
+  cursor: pointer;
+}
+.fx-logo-label { cursor: pointer; }
+.fx-logo-name {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fx-track {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+  margin-left: auto;
+}
+.fx-track input { accent-color: var(--accent); cursor: pointer; }
+
+/* face picker chips */
+.face-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.face-chips-hint {
+  flex-basis: 100%;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+.face-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.face-chip:hover { border-color: var(--text-dim); }
+.face-chip input { display: none; }
+.face-chip img {
+  width: 54px;
+  height: 54px;
+  object-fit: cover;
+  border-radius: 6px;
+  display: block;
+}
+.face-chip-fallback { font-size: 2rem; line-height: 54px; }
+.face-chip span { font-size: 0.62rem; color: var(--text-dim); }
+.face-chip:has(input:checked) { border-color: var(--accent); }
+.face-chip:has(input:checked) span { color: var(--accent); }

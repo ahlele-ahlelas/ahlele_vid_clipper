@@ -1,5 +1,6 @@
 venv/
 tmp/
+models/
 __pycache__/
 *.pyc
 *.pyo

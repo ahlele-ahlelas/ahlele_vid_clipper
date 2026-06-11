@@ -613,10 +613,16 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None, pr
 
     clip_path = os.path.join(clip_dir, clip_name)
 
-    # Use cached permanent clip; always re-render previews (may lack audio from prior run)
-    if not preview_only and os.path.exists(clip_path):
-        _add_clip_to_job(job_id, clip_name)
-        return clip_name
+    # Use cached clips (both permanent and preview) when they pass stream
+    # validation — repeat previews shouldn't re-download from the network.
+    # Audio not required here: a legitimately silent source would otherwise
+    # re-render forever. Missing-audio merges are caught at section stage.
+    if os.path.exists(clip_path):
+        if _has_video(clip_path):
+            if not preview_only:
+                _add_clip_to_job(job_id, clip_name)
+            return clip_name
+        _remove(clip_path)   # broken artifact (e.g. audio-only merge) — re-render
 
     _base_headers = {
         "User-Agent": (
@@ -637,37 +643,67 @@ def render_segment(job_id: str, seg_start: float, seg_end, cancel_event=None, pr
     raw_base = os.path.join(jobs.RAW_DIR, job_id)
 
     # ── Try ranged download ────────────────────────────────────────────────────
-    # Use a single combined stream (not bestvideo+bestaudio) for ranged download —
-    # split DASH formats often lose the audio track when byte-ranges are applied.
+    # Attempt 1: the user's quality format (bestvideo+bestaudio split DASH) —
+    # the only way to get >720p from YouTube; combined streams cap at 720p.
+    # Split DASH sections occasionally merge without audio, so verify with
+    # ffprobe and fall back to a combined progressive stream (attempt 2).
+    # The job remembers which attempt worked (range_fmt memo) so later renders
+    # skip straight to it instead of re-failing attempt 1 every time.
     # Skip ranged entirely if the full video is already cached (e.g. a prior clip
     # or "Render All" triggered a full download) — slicing the local file is
     # instant vs. a fresh network fetch per clip.
+    # For short videos with many pending clips ("Render All"), ONE full download
+    # shared via the per-job lock beats N separate section downloads — skip
+    # ranged and let the fallback path download once, then slice locally.
+    combined_fmt = "best[ext=mp4][acodec!=none]/best[acodec!=none]/best"
+    pending_n    = len(job.get("clips_pending") or [])
+    vid_duration = job.get("duration") or 0
+    prefer_full  = bool(vid_duration and vid_duration <= 900 and pending_n >= 4)
+
     section_file = None
-    if seg_end_val and not _find_file(raw_base):
+    if seg_end_val and not prefer_full and not _find_file(raw_base):
         tmp_prefix = os.path.join(clip_dir, f"_tmp_{int(seg_start)}_{int(seg_end_val)}")
-        try:
-            from yt_dlp.utils import download_range_func
-            # [acodec!=none] ensures the selected format has an audio track.
-            # Without it, yt-dlp picks DASH video-only mp4 streams (no audio).
-            range_fmt = "best[ext=mp4][acodec!=none]/best[acodec!=none]/best"
-            ydl_opts = {
-                "format": range_fmt, "quiet": True, "no_warnings": True,
-                "outtmpl": tmp_prefix + ".%(ext)s",
-                "download_ranges": download_range_func(None, [(seg_start, seg_end_val)]),
-                **_fast_dl_opts(),
-                "http_headers": _base_headers,
-                "progress_hooks": [_check_cancel],
-            }
-            _apply_browser_cookies(ydl_opts, job.get("browser"), job.get("cookiefile"))
-            _apply_fast_dl(ydl_opts)
-            _ydl_extract(ydl_opts, url, download=True)
-            matches = sorted(_glob.glob(tmp_prefix + ".*"))
-            if matches:
-                section_file = matches[0]
-        except Exception as e:
-            if cancel_event and cancel_event.is_set():
-                raise Exception("Cancelled by user")
-            section_file = None
+        from yt_dlp.utils import download_range_func
+        # Stale partials from a previous crashed run would confuse candidate
+        # selection — clear them before starting.
+        for m in _glob.glob(tmp_prefix + ".*"):
+            _remove(m)
+        # [acodec!=none] ensures the combined fallback has an audio track —
+        # without it, yt-dlp picks DASH video-only mp4 streams (no audio).
+        memo = job.get("range_fmt")
+        if memo == "combined":
+            range_fmts = [combined_fmt]
+        else:
+            range_fmts = [fmt, combined_fmt]
+        for range_fmt in range_fmts:
+            try:
+                ydl_opts = {
+                    "format": range_fmt, "quiet": True, "no_warnings": True,
+                    "merge_output_format": "mp4",
+                    "noplaylist": True,
+                    "outtmpl": tmp_prefix + ".%(ext)s",
+                    "download_ranges": download_range_func(None, [(seg_start, seg_end_val)]),
+                    **_fast_dl_opts(),
+                    "http_headers": _base_headers,
+                    "progress_hooks": [_check_cancel],
+                }
+                _apply_browser_cookies(ydl_opts, job.get("browser"), job.get("cookiefile"))
+                _apply_fast_dl(ydl_opts)
+                _ydl_extract(ydl_opts, url, download=True)
+                cand = _final_section_file(tmp_prefix, _glob)
+                # Section must carry BOTH streams — split-DASH merges can drop
+                # either one; a bad pick here renders a black/silent clip.
+                if cand and _has_video(cand) and _has_audio(cand):
+                    section_file = cand
+                    jobs.update(job_id, range_fmt=("split" if range_fmt == fmt else "combined"))
+                    break
+                for m in _glob.glob(tmp_prefix + ".*"):
+                    _remove(m)
+            except Exception:
+                if cancel_event and cancel_event.is_set():
+                    raise Exception("Cancelled by user")
+                for m in _glob.glob(tmp_prefix + ".*"):
+                    _remove(m)
 
     # -c:v copy keeps original video; -c:a aac converts to browser-compatible audio.
     # -map 0:v? and 0:a? are optional — won't fail if a stream is missing.
@@ -1098,6 +1134,49 @@ def _find_file(base: str) -> str:
         if os.path.exists(path):
             return path
     return ""
+
+
+_INTERMEDIATE_RE = re.compile(r"\.f\d+\.\w+(\.part)?$|\.part$|\.ytdl$", re.I)
+
+
+def _final_section_file(tmp_prefix: str, _glob) -> str:
+    """Pick the final merged section file, never a yt-dlp intermediate.
+    Plain glob is unsafe: split-DASH downloads leave .fNNN.* / .part files
+    that can sort before the merged output (→ audio-only clips)."""
+    exact = tmp_prefix + ".mp4"
+    if os.path.exists(exact):
+        return exact
+    finals = [m for m in sorted(_glob.glob(tmp_prefix + ".*"))
+              if not _INTERMEDIATE_RE.search(m)]
+    return finals[0] if finals else ""
+
+
+def _has_video(filepath: str) -> bool:
+    import shutil
+    ffprobe = shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe"
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", filepath],
+            capture_output=True, text=True, timeout=30,
+        )
+        return "video" in result.stdout
+    except Exception:
+        return False
+
+
+def _has_audio(filepath: str) -> bool:
+    import shutil
+    ffprobe = shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe"
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", filepath],
+            capture_output=True, text=True, timeout=30,
+        )
+        return "audio" in result.stdout
+    except Exception:
+        return False
 
 
 def _probe_duration(filepath: str) -> float:
